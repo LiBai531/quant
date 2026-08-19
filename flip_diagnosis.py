@@ -172,7 +172,14 @@ def collect_stats(fp_model, q_model, data, device, topk: int, chunk: int = 2):
         pbar.update(seq.shape[0])
     pbar.close()
     d = {k: np.concatenate(v) for k, v in out.items()}
-    d["rho"] = (np.array(rho_acc) / max(final_energy, 1e-12)) if rho_acc else np.array([])
+    # 块贡献能量（原始，未归一化）与残差流终能量；抵消比 = Σ‖F_l‖²/‖h_L‖²
+    if rho_acc:
+        blk = np.array(rho_acc)
+        d["rho_raw"] = blk
+        d["rho"] = blk / max(final_energy, 1e-12)          # 除以终能量（Σ可能远大于1，因抵消）
+        d["rho_norm"] = blk / max(blk.sum(), 1e-12)        # 相对份额（和为1），用于 γ 加权
+    else:
+        d["rho_raw"] = d["rho"] = d["rho_norm"] = np.array([])
     return d
 
 
@@ -290,11 +297,18 @@ def analyze(d, gamma_head=None, gamma_blocks=None):
     else:
         print(f"-> c 与 1 无显著差异（z={z:.1f}）：本制域表现为加性，乘性定律不迁移。")
     if gamma_head is not None:
-        rho = d["rho"]
-        g_body = float(sum(rho[l] * gamma_blocks.get(l, 0.0) for l in range(len(rho))))
+        rho_n = d["rho_norm"]
+        if len(rho_n) and len(gamma_blocks):
+            g_body = float(sum(rho_n[l] * gamma_blocks.get(l, 0.0) for l in range(len(rho_n))))
+        else:
+            g_body = 0.0
         c_pred = 1 - (gamma_head or 0.0) - g_body
-        print(f"γ 预测：γ_head = {gamma_head:.4f}   γ_body(块能量加权) = {g_body:.4f}"
+        cancel = float(d["rho"].sum()) if len(d["rho"]) else 1.0
+        print(f"γ 预测（ρ 归一化到和=1）：γ_head = {gamma_head:.4f}   γ_body(份额加权) = {g_body:.4f}"
               f"   -> c_pred = {c_pred:.4f}")
+        if cancel > 1.5:
+            print(f"注意：块贡献抵消比 Σ‖F‖²/‖h‖² = {cancel:.1f}（>1.5），说明残差流内贡献大幅抵消，"
+                  f"c_pred 使用归一化 ρ 已校正。")
         print(f"对照：c_fit = {c_fit:.4f}   |c_fit − c_pred| = {abs(c_fit - c_pred):.4f}"
               f"   （命中 ⇒ 投影理论成立；偏差大 ⇒ 检查通路假设）")
 
