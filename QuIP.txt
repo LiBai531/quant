@@ -1,0 +1,2345 @@
+                                                 QuIP: 2-Bit Quantization of
+                                        Large Language Models With Guarantees
+
+arXiv:2307.13304v2 [cs.LG] 15 Jan 2024              Jerry Chee                Yaohui Cai
+                                               Cornell University         Cornell University
+                                        jerrychee@cs.cornell.edu       yc2632@cornell.edu
+
+                                           Volodymyr Kuleshov         Christopher De Sa
+                                             Cornell University        Cornell University
+                                                                   cdesa@cs.cornell.edu
+                                         kuleshov@cornell.edu
+
+                                                                                    Abstract
+
+                                                  This work studies post-training parameter quantization in large language models
+                                                  (LLMs). We introduce quantization with incoherence processing (QuIP), a new
+                                                   method based on the insight that quantization benefits from incoherent weight
+                                                   and Hessian matrices, i.e., from the weights being even in magnitude and the
+                                                   directions in which it is important to round them accurately being unaligned with
+                                                   the coordinate axes. QuIP consists of two steps: (1) an adaptive rounding procedure
+                                                   minimizing a quadratic proxy objective; (2) efficient pre- and post-processing that
+                                                   ensures weight and Hessian incoherence via multiplication by random orthogonal
+                                                   matrices. We complement QuIP with the first theoretical analysis for an LLM-scale
+                                                   quantization algorithm, and show that our theory also applies to an existing method,
+                                                   OPTQ. Empirically, we find that our incoherence preprocessing improves several
+                                                   existing quantization algorithms and yields the first LLM quantization methods
+                                                   that produce viable results using only two bits per weight. Our code can be found
+                                                   at https://github.com/Cornell-RelaxML/QuIP.
+
+                                        1 Introduction
+
+                                        Large language models (LLMs) have enabled advances in text generation, few-shot learning, reason-
+                                        ing, protein sequence modeling, and other tasks [2, 30, 35]. The massive size of these models--often
+                                        reaching into hundreds of billions of parameters--requires sophisticated deployment methods and
+                                        motivates research into efficient inference algorithms.
+
+                                        This work studies the post-training quantization of LLM parameters as a way to improve their runtime
+                                        efficiency [4, 8, 22, 31, 33, 34]. Our key insight is that quantization can be most effective when weight
+                                        and proxy Hessian matrices are incoherent--that the weights themselves are even in magnitude,
+                                        and the directions in which it is important to have good rounding accuracy are not too large in any
+                                        one coordinate. Intuitively, incoherence can be thought of as a principled form of outlier reduction,
+                                        which makes it easier to adaptively round the weights to a finite set of compressed values. We use
+                                        this intuition to develop theoretically sound two-bit quantization algorithms that scale to LLM-sized
+                                        models.
+
+                                        Specifically, we introduce quantization with incoherence processing (QuIP), a new method motivated
+                                        by the above insight. QuIP consists of two steps: (1) an adaptive rounding [20] procedure, which
+                                        minimizes a quadratic proxy objective (W^ ) = tr((W^ - W )H(W^ - W )T ) of the error between the
+                                        original weights W and the quantized weights W^ using an estimate of the Hessian H; (2) efficient pre-
+                                        and post- processing that ensures that the weight and Hessian matrices are incoherent by multiplying
+
+                                        37th Conference on Neural Information Processing Systems (NeurIPS 2023).
+them by a Kronecker product of random orthogonal matrices. We denote "incoherence processing"
+as both the pre- and post- processing steps of our procedure. Incoherence processing can be viewed
+as a form of outlier suppression across the weights and the activation space.
+
+We complement our method with a theoretical analysis--the first for a quantization algorithm that
+scales to LLM-sized models--which analyzes the role of incoherence and shows that our quantization
+procedure is optimal within a general class of rounding methods. Interestingly, we find that QuIP
+without incoherence processing yields a more efficient implementation of an earlier algorithm,
+OPTQ [8]; our paper thus also provides the first theoretical analysis for that method.
+
+Empirically, we find that incoherence processing greatly improves the quantization of large models,
+especially at higher compression rates, and yields the first LLM quantization method that produces
+viable results using only two bits per weight. For large LLM sizes (>2B parameters), we observe
+small gaps between 2-bit and 4-bit compression that further decrease with model size, hinting at the
+feasibility of accurate 2-bit inference in LLMs.
+
+Contributions. In summary, this paper makes the following contributions: (1) we propose QuIP, a
+quantization method based on the insight that model parameters should ideally be incoherent; (2) we
+provide a theoretical analysis for a broad class of adaptive rounding methods that encompass QuIP
+and OPTQ; (3) we demonstrate that QuIP makes two-bit LLM compression viable for the first time.
+
+2 Related Work
+
+Adaptive rounding. Nagel et al. [20] are the first to motivate the "adaptive rounding" proxy
+objective (Eq. (1)) in a principled way. There are many quantization methods which quantize by
+optimizing this proxy objective [5, 6, 9, 12, 14, 20, 32]. Many require further retraining which can
+be expensive, and are not evaluated on the current largest open LLMs (OPT [35], BLOOM [30]).
+Lybrand and Saab [15] propose a greedy per-neuron quantization procedure that is similar to ours,
+except they do not consider arbitrary linear functions of the error correction. Their work bounds the
+proxy objective, albeit on the first layer only.
+
+Post training quantization in large models. There is a growing body of work on PTQ in LLMs
+such as OPT and BLOOM. The size of these models make it difficult to apply previously developed
+methods. The majority of these methods make quantization easier by somehow reducing the range
+of weights or activations, but still use nearest rounding. SmoothQuant [31] rescales between acti-
+vations and weights to remove outliers from the activations and make quantization overall easier.
+ZeroQuant [33] proposes a per-layer knowledge distillation method. LLM.int8() [4] decompose
+matrix multiplications into a majority of 8 bit and a minority of 16 bit operations. LUT-GEMM [22]
+designs kernels to accelerate quantized matrix multiplications. RPTQ [34] reorders activations and
+quantizes them in groups, reducing the impact of range differences between channels.
+
+OPTQ (Formerly known as GPTQ). OPTQ [8] is based on OBQ [7], and proposes a novel rounding
+method that can work on the largest OPT and BLOOM models. The method works iteratively over the
+weight columns in a fixed order: (1) quantize with nearest rounding and compute the error, (2) update
+the remaining weights with a scaled error, and (3) repeat.
+
+Other quantization methods. There are other quantization procedures which do not round based on
+the proxy objective of [20], or are not designed for the largest language models [10, 11, 13, 19, 28,
+29].
+
+3 Quantization With Incoherence Processing: Adaptive Rounding Step
+
+This section introduces quantization with incoherence processing (QuIP), a new method consisting of:
+(1) an adaptive rounding step; (2) efficient pre- and post-processing that ensures weight and Hessian
+incoherence. We define and analyze step (1) in this section; the next section focuses on step (2).
+
+Following existing state-of-the-art post-training quantization methods, we round weights per-layer by
+minimizing the "adaptive rounding" proxy objective, as in Nagel et al. [20],
+
+2
+(W^ ) = Ex (W^ - W )x = tr (W^ - W )H(W^ - W )T .
+                                                                    (1)
+
+   2
+Here, W  Rm×n is the original weight matrix for a given linear layer, W^  Rm×n are the quantized
+weights, x  Rn is an input vector drawn uniformly at random from a calibration set, and H is the
+second moment matrix of these vectors, interpreted as a proxy Hessian. Crucially, this formulation
+
+lets the quantization be run in parallel across neurons, which is tractable for large language models [8].
+
+For simplicity, we will focus in this section on rounding to the integers; subsequent sections will
+
+extend the analysis to finite grids.
+
+3.1 LDLQ: An Optimal Adaptive Rounding Method
+
+Our strategy is to define a family of adaptive rounding methods for optimizing objective (1) and then
+define LDLQ, the optimal method within that class. Our defined methods iteratively perform the
+following update for k = 1, 2, ..., n:
+
+                           W^ k = Q(Wk + (W1:(k-1) - W^ 1:(k-1))ak),
+
+where Wk denotes the k-th column, W1:(k-1) denotes the first k - 1 columns, the subroutine Q
+
+denotes either nearest rounding or standard unbiased rounding to the integers (which rounds up or
+down such that E [Q(z)] = z), and ak  Rk-1 is some sequence of vectors. This scheme rounds
+columns one at a time; at each step, it adds a "correction" term that is a linear function of the residual
+
+from the rounding we have done so far. The final W^ satisfies the following matrix equation:
+
+                                 W^ = Q(W + (W - W^ )U ),                                    (2)
+
+where U is a strictly upper-triangular matrix whose columns are the vectors ak and Q acts elementwise.
+Because U is upper-triangular, W^ k only depends on W^ 1:(k-1).
+
+If we let  = Q(W + (W - W^ )U ) - (W + (W - W^ )U ) denote the quantization error of Q, we
+find that W^ - W = (U + I)-1 and we can rewrite objective (1) as
+
+             tr((W^ - W )H(W^ - W )T ) = tr((U + I)-1H(U + I)-T T ).                         (3)
+
+The LDLQ Method How should we specify U , the linear feedback from the quantization error of
+
+preceding columns in (2)? Equation 3 provides an answer. If we choose U  U` such that the LDL
+
+decomposition of H is
+
+                                 H = (U` + I)D(U` + I)T ,                                    (4)
+
+where D is a (non-negative) diagonal matrix and U` is upper unit triangular, then the terms (U + I)
+in Eq. (3) cancel. We denote as LDLQ the rounding procedure in Eq. (2) with U  U` as the LDL
+assignment from Eq. (4). We will now see that the LDL assignment of U is in fact optimal.
+
+3.2 Deriving the Optimality of the LDLQ Adaptive Rounding Procedure
+
+In order to reason about optimality, we consider weights which are worst and average-case for the
+proxy loss. Let A denote a rounding method, and let A(W, H) be the resulting quantized weights.
+Define the worst-case (Lworst) and average (Lavg) proxy losses with respect to the input weights as
+
+   Lworst(A, H) = sup E tr (A(W, H) - W )H(A(W, H) - W )T                                    (5)
+
+                       W Rm×n
+
+          Lavg(A, H) = EW Unif[0,1]m×n tr (A(W, H) - W )H(A(W, H) - W )T .                   (6)
+
+Theorem 1. LDLQ is worst and average-case optimal amongst rounding methods which specify the
+linear feedback U as a function of H (not of W ), and when rounding to the integers. That is, for all
+rounding methods A in the class described by Eq. (2), for all positive semi-definite H, and for Q as
+either nearest or stochastic rounding,
+
+m  tr(D)  =  Lworst(LDLQ,  H)    Lworst(A,  H)  and  m  tr(D)  =  Lavg(LDLQ,  H)    Lavg(A,  H ),
+4                                                    c
+
+where D is the matrix from the LDL decomposition of H, and c = 12 for nearest, c = 6 for stochastic.
+
+Remarks. The number of rows being quantized is m, and each quantization method operates across
+the n entries of each row. For all rounding methods described by Eq. (2), and for all positive semi-
+definite H, Q as nearest rounding achieves the same worst-case proxy loss as stochastic rounding,
+but achieves better average proxy loss.
+
+                                                3
+Normalized eigenvalues
+
+                                               After incoherence max |Wij|
+                                                                                             After incoherence max |eigvec(H)ij|
+ 100                 Block 16 k_proj  0.5                                                                                         1.0
+10 1                 Block 20 q_proj  0.4                                                                                         0.8
+10 2                 Block 30 fc1     0.3                                                                                         0.6
+10 3                                  0.2                                                                                         0.4
+10 4      500 1000 1500 2000 2500     0.1                                                                                         0.2
+10 5                                  0.0
+                                                                                                                                           0.2 0.4 0.6 0.8 1.0
+       0                                       0.1 0.2 0.3 0.4 0.5
+                                                                                                                                    Before incoherence max |eigvec(H)ij|
+                                            Before incoherence max |Wij|
+
+Figure 1: eig(H) from OPT-2.7b.       Figure 2: Max |Wij| before          Figure 3: Max |Qij| before
+                                      and after incoherence process-      and after incoherence process-
+                                      ing on OPT-2.7b.                    ing, with Q the eigenvectors of
+                                                                          H on OPT-2.7b.
+
+Moving beyond a generic algorithm A within our framework, we consider the common baselines of
+nearest and stochastic rounding. These methods are represented within our framework by choosing
+the appropriate Q subroutine, and setting all entries of the linear feedback to zero.
+
+For these baseline methods, their optimality gap to LDLQ is governed by tr (D) vs. tr (H). For
+any non-diagonal H~  0, LDLQ achieves strictly lower worst and average-case proxy loss because
+tr (D) < tr(H~ ). Let B = {Near, Stoch}. Then, Lworst(LDLQ, H~ ) < Lworst(Stoch, H~ ) and
+Lavg(LDLQ, H~ ) < Lavg(B, H~ ). Across OPT models 125m to 2.7b, tr (D) / tr (H)  0.65--
+empirically verifying that the gap is not insignificant. See Supplement C for full details.
+
+3.3 Incoherence: Optimality with a Spectral Bound
+
+Theorem 1 gives exact expressions for the proxy loss, albeit with tr (D), which can be difficult to
+reason about. In Figure 1, we empirically observe that H is approximately low-rank: we visualize
+the spectrum of several randomly chosen H from OPT-2.7b, and observe that the spectrum decays
+rapidly. In fact, across all layers of OPT-125m to 2.7b models, a vast majority of H matrices have
+fewer than a quarter of eigenvalues > 1% of the max eigenvalue; see Supplement C for full details.
+Given this observation about the low rank of H, can we bound the behavior of LDLQ, and thus
+tr (D), using the spectrum of H?
+
+We do this building on a variant of the incoherence assumption that is specialized to our case [3, 24].
+
+Definition 1. We say a symmetric Hessian matrix H  Rn×n is µ-incoherent if it has an eigende-
+composition H = QQT such that for all i and j, |Qij| =  e  T  Qej          µ/                                                         n. By extension, we say
+                                                           i                                                                                         
+                                                                                                                                       µ W F / mn.
+a weight matrix W  Rm×n is µ-incoherent if all i and j, |Wij| =           e  T  W                                                 ej
+                                                                             i
+
+Note that "most" n × n matrices are incoherent with µ = O(log n) = O~(1) because a random
+orthogonal matrix has entries with squared-magnitudes that concentrate around their mean of 1/n.
+Incoherence in W can be viewed as a form of outlier reduction: a small bound on the magnitude of its
+entries means that we do not need to scale it as much to make it fit in the finite range of representable
+low-precision numbers. Figures 2 and 3 plot the max absolute weight and hessian eigenvector entries
+before and after our incoherence processing, on all layers in OPT-2.7b. A line with slope=1 is drawn
+for reference. We see that W and H are more incoherrent after our incoherence processing is applied.
+Making H incoherent is less intuitive, but its utility is motivated by the following lemma.
+
+Lemma 2. Let H  Rn×n be a µ-incoherent positive semi-definite symmetric matrix and let
+H = (U` + I)D(U` + I)T be its LDL Cholesky decomposition, where U` is a strictly upper triangular
+matrix and D is a (non-negative) diagonal matrix. Then,
+
+                                      tr (D)  µ2 2 tr H1/2 .
+                                                  n
+
+To the best of our knowledge, this is a novel result using incoherence to obtain a bound on tr (D) that
+depends only on the spectrum of H. To help interpret this result, we derive explicit proxy losses for
+plain nearest and stochastic rounding, which we will then compare to what LDLQ gets via Lemma 2.
+
+                                      4
+Algorithm 1 QuIP - Incoherence Pre-Processing
+
+Require: b  N, H  Rn×n SPD, original W  Rm×n,   R+,   [0, 1]
+1: seeded sample random two-factor orthogonal matrices U  Rm×m and V  Rn×n
+2: H = H +   mean(diag(H))I                                                      from OPTQ
+                                                            
+3: D~  4 diag(H)/ diag(W T W )                            4     applies element-wise
+
+4: W  W D~ ; H  D~ -1HD~ -1                                                             diagonal rescaling
+                                                                                               incoherence
+5:  W    U  W  V  T;  H   V HV T
+                                                      reduced quantization range due to incoherency
+6: s  W F / mn; W  12 ( 1s W + 1)                                    rescale W to lie within [0, 2b - 1]
+7: W  clamp(W  (2b - 1), 0, 2b - 1)
+
+8: return W, H, s, D~
+
+Algorithm 2 QuIP - Incoherence Post-Processing
+
+Require: b  N, H  Rn×n SPD, quantized W  [0, 2b - 1]m×n, s  R & D~  Rn×n (Alg 1)
+ 1: seeded sample random two-factor orthogonal matrices U  Rm×m and V  Rn×n
+ 2: W  s  (W/(2b - 1))  2 - 1
+
+3: W  U T W V ; H  V T HV                                         revert incoherence
+4: return W  W D~ -1                                       revert diagonal rescaling
+
+Lemma 3. Let H be symmetric positive definite. In the worst case stochastic rounding achieves
+Lworst(Stoch, H) = (m/4) tr (H). In the average case nearest and stochastic rounding achieve
+Lavg({Near, Stoch}, H) = (m/c) tr (H), where c = 12 for nearest, and c = 6 for stochastic.
+
+To interpret this result, consider H rank-k with µ2k < n. By Cauchy-Schwarz, tr(H1/2)2  k tr (H).
+Combining Lemma 2 with the LDLQ proxy losses of Theorem 1 and comparing with Lemma 3,
+
+                                  mµ2   H 1/2  2 mµ2k  m
+       Lworst(LDLQ, H)  4n tr           H 1/2   4n tr (H)  4 tr (H) = Lworst(Stoch, H)
+
+                                  mµ2          2 mµ2k  m
+         Lavg(LDLQ, H)  cn tr                   cn tr (H)  c tr (H) = Lavg(B, H),
+
+where B  {Near, Stoch}, and c is as given in Theorem 1. This shows that for sufficiently low-rank
+H, LDLQ is asymptotically better than plain nearest and stochastic rounding by a factor of µ2k/n.
+
+Without incoherence: no improvement with a spectral bound. By assuming incoherence, we
+were able to show LDLQ gets an asymptotically better bound in terms of just the spectrum of H.
+We might ask: was the incoherence assumption necessary to get this result? The following theorem
+answers this question in the affirmative by showing that without incoherence, the best spectral bound
+for LDLQ cannot differentiate it from the nearest and stochastic rounding baselines.
+
+Theorem 4. Consider all H~ with the same spectrum as H. For any positive semi-definite H, the
+following holds. On the worst-case loss LDLQ achieves the same error as stochastic rounding,
+
+                                               ~             m
+                  sup                Lworst(LDLQ, H) = Lworst(Stoch, H) = tr (H) .
+                                                             4
+            H~ s.t. eig(H~ )=eig(H)
+
+On the average-case loss LDLQ achieves the same error as the corresponding rounding routine. Let
+B = {Near, Stoch} and c = 12 for nearest, c = 6 for stochastic.
+
+                                               ~          m
+                         sup            Lavg(LDLQ , H) = Lavg(B, H) = tr (H) .
+                                                          c
+               H~ s.t. eig(H~ )=eig(H)
+
+Note that the worst case for comparing LDLQ against these baselines occurs when H is diagonal, see
+Theorem 1 and Lemma 3. Assuming incoherence as we do is a natural way to exclude such cases.
+
+4 Quantization With Incoherence Processing: Incoherence Processing Step
+
+Next, we leverage the above incoherence analysis to introduce incoherence processing, the second
+step of the QuIP algorithm. Our strategy will be to pre-process weight and Hessian matrices to ensure
+
+                                                  5
+the favorable incoherence properties outlined above. One straightforward way to make a symmetric
+matrix incoherent is to conjugate it by a uniform random orthogonal matrix: this will result in each of
+its eigenvectors being a random unit vector, whose entries will concentrate around magnitude n-1/2.
+
+Specifically, let U  Rm×m and V  Rn×n be two random orthogonal matrices. (Let's temporarily
+ignore how these matrices are generated, or how we would efficiently perform inference.) We
+ensure the weight and Hessian are incoherent with high probability through random orthogonal
+multiplications H~  V HV T and W~  U W V T . Importantly, this transformation preserves the
+proxy quadratic form since tr(W~ H~ W~ T ) = tr((U W V T )(V HV T )(V W T U T )) = tr(W HW T ).
+
+4.1 Incoherence via Efficient Orthogonal Multiplication
+
+If all we wanted to do was to store or transmit the weights of the quantized neural network, the above
+procedure would introduce no overhead, since we can generate a random orthogonal matrix from
+a seed--making it essentially free to store. However, for running inference on a DNN, we need to
+multiply by the weight matrix W , and here the need to manifest and multiply by n × n random
+orthogonal matrices U, V would be prohibitive.
+
+To handle this, we propose to instead use a distribution over random orthogonal matrices for which
+multiplication is fast. Let n = pq be a factorization of n (where p  q  n), and set U = UL  UR
+where UL is sampled uniformly from the p × p orthogonal matrices and UR is sampled uniformly
+from the q × q orthogonal matrices. Multiplication of a vector x  Rn by the matrix U can be
+accomplished by reshaping to a p × q matrix, multiplying on the left by UL and the right by U TR , and
+then reshaping back: this takes O(n(p + q)) = o(n2) operations. Using more than two factors in this
+way is also possible, but using two suffices to make this preprocessing asymptotically non-dominant.
+
+Lemma 5. Let H be a positive semi-definite matrix on Rn×n and W a matrix on Rm×n, and suppose
+that m = p1 · p2 · · · pk and n = q1 · q2 · · · qk. Let U1, U2, . . . , Uk, V1, V2, . . . , Vk be independent
+random orthogonal matrices on Rpi×pi and Rqi×qi respectively. Set U as the Kronecker product
+U = U1  U2  · · ·  Uk and V as V = V1  V2  · · ·  Vk Then V HV T is µH -incoherent with
+probability at least 1 - , and U W V T is µW -incoherent with probability at least 1 - , where
+
+µH = Ak/2 log  C kn2  k/2                                  2C kmn  k
+                                                               
+                          = O~ (1) and µW = Ak log                   = O~ (1)
+
+for some global constants A and C independent of n and k.
+
+Remarks. This lemma means that multiplying by a random matrix in this family suffices to make a
+matrix incoherent with parameter µ only poly-logarithmic in the matrix size. In our experiments we
+use k = 2 factors to construct the orthogonal matrices U, V .
+
+4.2 Additional Heuristics
+
+We outline QuIP pre-processing and post-processing in Algorithms 1 and 2, respectively. In line 5 of
+Algorithm 1, we apply the aforementioned fast orthogonal multiplication procedure to ensure W and
+H are incoherent. We also randomly permute entries at the fast matrix multiplication step to prevent
+any correlation between attention heads from worsening performance. We introduce a number of
+additional heuristic improvements that further improve performance.
+
+Incoherence-Based Heuristics. Line 4 diagonally rescales W and H to minimize (W^ ) 
+tr (H) W 2F , effectively trading off the spectrum of these matrices to find a minimum. Moti-
+vated by the incoherence of W , Line 6 computes the quantization range depending on the spectrum
+W F , instead of the typical maxi,j |Wij|. Our full QuIP procedure is described in Algorithm 3,
+which contains calls to the pre- and post-processing sub-steps in Algorithms 1 and 2.
+
+Greedy local search. Our basic procedure yields a good initial guess with error guarantees. We can
+further lower the proxy loss by running coordinate descent after LDLQ (but before post-processing),
+updating the weights in the same order as in the initial pass. See Supplement B for full details.
+
+                      6
+Algorithm 3 QuIP: Quantization with Incoherence Processing
+
+Require: b  N, H  Rn×n SPD, W  Rm×n, Q  {Near, Stoch},   R+,   [0, 1]
+1: W^ , H, s, D~  Alg 1(b, H, W, , )
+                                                                                  QuIP Incoherence Pre-Procesing
+
+2: H = (U` + I)D(U` + I)-1                                                                         LDL decomposition
+
+3: for k  {1, . . . , n} do W^ k  clamp(Q(Wk + (W - W^ )U`k), 0, 2b - 1)                                           LDLQ
+
+4: return W^  Alg 2(b, H, W^ , s, D~ )                                            QuIP Incoherence Post-Processing
+
+5 Extensions and Further Analyses
+
+5.1 OPTQ is a Special Case of LDLQ
+
+We prove a novel theoretical insight: QuIP without incoherence processing (i.e., LDLQ) is equivalent
+to a more efficient version of the OPTQ algorithm. That is, OPTQ falls under our class of adaptive
+rounding procedures with linear feedback, and is within-class optimal.
+Theorem 6. OTPQ [8] falls within the class of adaptive rounding procedures with linear feedback
+as described by Eq. (2), and is equivalent to LDLQ in Section 3.
+
+Remarks. To the best of our knowledge, this equivalence yields the first theoretical analysis of OPTQ.
+Even though the two methods are equivalent, LDLQ is more efficient. OPTQ's implementation
+requires a matrix inversion of H, and two Cholesky decompositions. Our implementation of LDLQ
+performs no matrix inversion, and only one Cholesky decomposition.
+
+Empirical Verification. The quantized outputs of the OPTQ implementation [8] are shown to be
+exactly identical to the outputs of our LDLQ implementation. Synthetic random data was used, with
+W  Unif[0, 1]1000×1000. Full details can be found in Supplement C.
+
+5.2 A Bound for Rounding to a Finite Grid                                        104
+
+In Section 3, we saw that LDLQ (equivalently, OPTQ) is           tr(W W)H(W W)T  103              LDLQ (nearest)
+optimal for minimizing the adaptive rounding objective.                                           LDLQ (stoch)
+However, this analysis assumed rounding to the integers.                                          nearest
+In practice, we do not want to round W just to the integers,                     102              stoch
+but instead to scale it, shift it, and round it a finite subset                                   LDLQ (nearest, no clamp)
+corresponding to a b-bit integer. To do this, the "real"
+LDLQ algorithm uses a clamp operation to restrict the                            101
+range of quantized values. Is LDLQ still optimal when
+this small change is made? It turns out that the answer is                            102                  103
+no, as the following concrete example illustrates.                                                matrix size n
+
+                                                                                 Figure 4: LDLQ underperforms.
+
+Finite Grid Counterexample. Figure 4 illustrates the behavior of LDLQ and other rounding
+
+methods--when restricted via clamping to a finite 4-bit grid [0, 15]--on a particular example where
+H is a (cleverly chosen) small perturbation of (In + 1n×n - eneTn )/n, and W has m = 16 and is a
+small perturbation of 1m×n/2. Details of the setup appear in Supplement C. The figure shows that
+clamped LDLQ with nearest rounding is asymptotically worse, and the clamping to the finite grid is
+
+what causes it to be worse in this case.
+
+Note that in our experiments in practice, OPTQ has been shown to soundly beat nearest rounding.
+This clamping issue does not seem to arise in practice; however, since it is possible we do need to
+take it into account to prove useful end-to-end bounds.
+
+A Procedure With a Bound. In order to address the above issues in theory, here we describe a
+method that acts to restrict the value of |W^ ij - Wij|, so that the rounded weights will remain inside
+the grid if W is sufficiently far inside. We do this via the optimization problem with hyperparameter c
+
+minimize: tr HRT R
+
+over: R unit upper triangular                                                                                     (7)
+
+subject to:                 e  T  R     T  R  ei    1 + c,  i                    {1, . . . , n}.
+                               i
+
+                                                  7
+Our "fixed" algorithm solves this convex problem (e.g. with ADMM), then runs QuIP using stochastic
+rounding and U = R-1 - I in place of the LDL decomposition. Observe that for sufficiently large c,
+this is exactly equivalent to base QuIP, since the solution of that optimization problem is given by the
+LDL decomposition when the constraint is dropped. Doing this (the full algorithm is given in the
+supplemental) yields the following theorem.
+Theorem 7. Suppose that we run Algorithm 5 (Supplement) to quantize a matrix W  Rm×n by
+solving the objective (7). Then there exists an assignment of the algorithm's hyperparameters c and 
+such that with probability at least 1 - , all the quantized weights will be in range (no overflow or
+need for clipping) and
+
+                    tr (W^ - W )H(W^ - W )T = O~ 1 n24b tr H1/2 2 W 2F .
+
+In practice, because clamping rarely causes issues, and because of the significant additional compute
+needed to solve this program, we always just use QuIP as described in the previous sections, which is
+equivalent to setting c large and using nearest rounding.
+
+6 Experiments
+
+Overview. We quantize the OPT [35] family of models (up to 66B parameters) and Llama 2 70B [27]
+using various quantization and processing methods. QuIP is superior to OPTQ and other baselines
+across all model sizes and evaluation tasks. Most interestingly, incoherence processing yields
+excellent performance using as little as two bits per weight when paired with any of the quantization
+methods we consider (including nearest rounding). Two-bit quantization with QuIP is viable at even
+moderate model sizes (1B parameters), a regime where other two-bit quantization methods fail. At
+the largest model sizes, the difference between 2-bit and 16-bit weight performance becomes small.
+We compare the throughput of QuIP with OPTQ's efficient implementation on language generation
+and show that it is not much slower. Additional results on the effectiveness of the proxy loss, unbiased
+rounding, and Algorithm 5 are presented in the Supplement C.
+
+Setup. The experimental infrastructure is built on top of OPTQ's [8] repository which is implemented
+in PyTorch [23]. We quantize the HuggingFace implementations of the OPT and Llama 2 model
+families. All models are quantized on a single GPU, with up to 48GB of memory. Our calibration
+set is the same as OPTQ; 128 random 2048 token segments from the C4 dataset [25] consisting of
+generic text data from crawled websites. Therefore, no task-specific data is viewed when quantizing.
+Following OPTQ, quantization is performed one Transformer block at a time: loaded into GPU mem-
+ory, the Hessian computed, and then the weights quantized. The current block's inputs are then passed
+through the quantized block to produce inputs for the following block. The Hessian is computed from
+the quantized Transformer up to that point rather than from the full precision model; like OPTQ, we
+find this improves quantization. Further details on the setup can be found in Supplement C, including
+a description of the computational resources used to perform the experiments.
+
+Methods. We evaluate compositions of several quantization and pre/post processing methods. For
+quantization methods, we evaluate nearest rounding, LDLQ (or OPTQ), and two variations. LDLQ-
+RG re-orders the weights based on diag(H) to modify the quantization order and adds further
+greedy updates to the proxy. "Greedy" performs the greedy updates only. We evaluate the baseline
+preprocessing from OPTQ which adds H  H +   mean(diag(H))I for numerical stability. We
+also evaluate our incoherence processing in Algorithms 1 and 2, denoted as "IncP". With this notation
+QuIP = LDLQ + IncP, and QuIP-RG = LDLQ-RG + IncP.
+
+Datasets. We evaluate on the following language generation tasks: WikiText2 [17], Penn Treebank
+(PTB) [16], and C4. We also evaluate on zero-shot tasks, including LAMBADA (LAMB) [21], ARC
+Easy (ArcE) [1], PiQA [26], and StoryCloze (SC) [18]. See Supplement C for the full set of results.
+
+Main Results. QuIP is the first PTQ procedure to achieve good quantization at two bits per weight,
+across a variety of LLM sizes and evaluation tasks. In Figure 5 we compare QuIP and OPTQ when
+quantizing to 2 and 3 bits per weight (4-bit quantization works equally well for both methods); we
+evaluate OPT models (up to 66B) on PTB, C4, ARC Easy, and LAMBADA. QuIP is superior to
+OPTQ across the model sizes and evaluation tasks. At three bits, QuIP matches the full precision
+model reasonably well. At two bits and for larger LLMs (>2B parameters), QuIP begins to approach
+the performance of the full precision model. As model size increases, so does the quality of QuIP's
+
+                                                           8
+                  FP16  OPTQ-W3             OPTQ-W2                                     QuIP-W3       QuIP-W2
+
+                                                                            104
+    104
+Accuracy on ArcE Perplexity on PTB
+                                             Accuracy on LAMB Perplexity on C4
+    103 103
+
+    102 102
+
+    101                                                                       101
+
+    0.6           100         101                                               0.6              100           101
+    0.5           # params in billions                                                           # params in billions
+    0.4                                                                         0.4
+    0.3
+                                                                                0.2
+      10 1
+                                                                                0.0
+                                                                                  10 1
+
+Figure 5: Quantizing OPT models up to 66B parameters. Our method QuIP is the first PTQ procedure
+to achieve good quantization at 2 bits per weight, across a variety of model sizes and evaluation tasks.
+
+                        OPTQ                                                                          QuIP (Ours)
+
+WBits Wiki C4 ArcE PiQA SC Wiki C4 ArcE PiQA SC
+
+16          3.319 5.709 59.72 80.90 79.95 3.319 5.709 59.72 80.90 79.95
+
+4           3.596 5.905 58.96 80.52 79.12 3.531 5.869 59.81 80.47 79.63
+
+3           4.907 7.099 54.38 78.56 77.72 3.853 6.135 59.81 80.25 79.31
+
+2 123.908 70.541 25.34 50.54 51.75 6.326 8.937 54.38 75.08 75.37
+
+Table 1: Quantizing Llama 2 70B with QuIP and OPTQ, and evaluating on language generation and
+zeroshot tasks. Our incoherence processing enables a step function change in quantization at 2 bits.
+
+                       Baseline Processing                                                       Incoherence Processing (Ours)
+
+WBits Wiki PTB          C4 ArcE LAMB Wiki PTB C4 ArcE LAMB
+
+16          9.56  14.04 11.45 65.40 72.40 9.56 14.04 11.45 65.40 72.40
+
+                        OPTQ                                                                          QuIP
+
+4           9.59  14.22 11.56 64.77 72.39 9.60 14.18 11.50 65.32 73.20
+
+3        10.32 15.36 12.23 60.19 68.89 9.79 14.37 11.66 65.28 72.68
+
+2        71.70 88.19 29.59 42.47 25.77 11.48 17.40 13.55 57.87 65.24
+
+                        LDLQ-RG                                                                       QuIP-RG
+
+4           9.64  14.20 11.56 63.76 71.94 9.66 14.11 11.51 64.86 71.86
+
+3        10.31 15.15 12.15 63.43 69.78 9.75 14.44 11.68 63.51 71.53
+
+2        49.40 73.45 29.12 41.20 26.35 11.68 16.94 13.44 59.51 62.31
+
+                        Greedy                                                                        Greedy + IncP
+
+4           9.69  14.33 11.59 63.09 72.37 9.72 14.23 11.52 65.99 71.71
+
+3        13.63 23.05 16.30 50.51 56.76 9.92 14.45 11.71 63.80 71.38
+
+2        4816.6 3473.81 3183.2 26.30 0.00 11.59 17.39 13.30 58.80 64.47
+
+                        Near                                                                          Near + IncP
+
+4        10.77 15.41 13.52 61.28 70.42 9.77 14.16 11.53 64.06 71.41
+
+3        1564.9 1526.2 1808.2 34.47 1.73                                                9.89 14.49 11.74 64.06 71.41
+
+2 41547.8 34348.6 24815.7 25.80 0.00 12.04 18.12 14.11 56.36 60.64
+
+Table 2: Quantizing OPT-30b with various quantization and processing methods, and evaluating on
+language generation and zeroshot tasks. Our incoherence processing enables a step function change
+in quantization at 2 bits, across all rounding methods.
+
+                                            9
+Wbits Rescale Incoherence Rescale+Incoherence Rescale+Incoherence+Quant Range
+
+4  24.30      24.32  24.05                                                 23.89
+
+3  32.62      42.28  31.32                                                 26.36
+
+Table 3: Ablating sub-steps of QuIP's incoherence processing, see Algorithm 1. Perplexities are
+
+averaged over WikiText2, PTB, and C4 for OPT-350m.
+
+2-bit quantization. We provide plots on the remaining datasets in Supplement C. Note that the dip in
+OPTQ on OPT-66B is documented in their paper.
+
+Table 1 shows the results of quantizing Llama 2 70B using QuIP and OPTQ. Again, QuIP achieves
+good quantization at two bits while OPTQ does not.
+
+Incoherence Processing Ablation. Table 2 shows all combi-           Method  Throughput
+nations of quantization and processing methods evaluated on
+OPT-30B. At lower weight bits, QuIP's incoherence processing         QuIP      81ms
+dramatically improves the performance of all quantization meth-     OPTQ       53ms
+ods, across all evaluation tasks. Remarkably, all quantization
+methods--even nearest--are viable at two bits with our inco-        Table 4: Average per-token
+herence processing. Our modifications in QuIP-RG sometimes          throughput (batch size 1) when gen-
+give an improvement over QuIP, but further study is required        erating sequences of length 128
+to evaluate these modifications. Figures for OPT-125M to 13B        with OPT-66B on an A6000 GPU.
+are in Supplement C.
+
+Throughput Comparison. We evaluate the additional overhead of our incoherence processing during
+model inference by modifying OPTQ's efficient forward pass. OPTQ's implementation contains a
+quantized-matrix full-precision-vector product kernel and was shown to offer speedups over a FP16
+baseline. Our incoherence processing additions are performed in PyTorch. Table 4 shows that our
+QuIP implementation is about 1.5× slower than OPTQ.
+
+Further Ablation. QuIP's incoherence processing contains several sub-steps. Table 3 shows their
+relative contributions; all are necessary for the full improvement. Table 5 shows that the random
+permutation step within the fast orthogonal multiplication also significantly reduces perplexity.
+
+7 Conclusion
+
+This paper introduced quantization with incoherence process-        Wbits  Perplexity from
+ing (QuIP), an algorithm consisting of (1) an optimal adaptive             random permute
+rounding procedure which minimizes a quadratic proxy of the           4
+weight error, and (2) efficient pre- and post-processing to ensure    3           -0.22
+the incoherence of the weight and Hessian matrices by mul-            2           -9.96
+tiplying them by a Kronecker product of random orthogonal                         -74.2
+matrices. We showed that QuIP quantization is optimal in a
+general class of adaptive rounding methods with linear feed-        Table 5: Ablating random permu-
+back; this theoretical analysis is the first for any quantization   tation within fast orthogonal multi-
+algorithm that scales to LLM-sized models.                          plication. Differences in perplexity
+                                                                    are averaged over WikiText2, PTB,
+Empirically, QuIP achieves the first viable two-bit quantization    and C4 for OPT-125m.
+results for LLMs, especially at large model sizes, hinting at the
+feasibility of accurate 2-bit inference in LLMs.
+
+Acknowledgements and Disclosure of Funding
+
+This work was partially funded by the National Science Foundation under awards DGE-1922551,
+CAREER awards 2046760 and 2145577, by the National Institute of Health under award MIRA
+R35GM151243, and a gift from CISCO.
+
+                     10
+References
+
+ [1] Michael Boratko, Harshit Padigela, Divyendra Mikkilineni, Pritish Yuvraj, Rajarshi Das,
+      Andrew McCallum, Maria Chang, Achille Fokoue-Nkoutche, Pavan Kapanipathi, Nicholas
+      Mattei, Ryan Musa, Kartik Talamadupula, and Michael Witbrock. A systematic classifica-
+      tion of knowledge, reasoning, and context within the ARC dataset. In Proceedings of the
+      Workshop on Machine Reading for Question Answering, pages 60-70, Melbourne, Australia,
+      July 2018. Association for Computational Linguistics. doi: 10.18653/v1/W18-2607. URL
+      https://aclanthology.org/W18-2607.
+
+ [2] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+      Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, and et. al. Language models
+      are few-shot learners. In Conference on Neural Information Processing Systems, 2020.
+
+ [3] Christopher De Sa, Kunle Olukotun, and Christopher Ré. Global convergence of stochastic
+      gradient descent for some non-convex matrix problems. In International Conference on Machine
+      Learning. PMLR, 2015.
+
+ [4] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Llm.int8(): 8-bit matrix
+      multiplication for transformers at scale. In Conference on Neural Information Processing
+      Systems, 2022.
+
+ [5] Zhen Dong, Zhewei Yao, Amir Gholami, Michael W. Mahoney, and Kurt Keutzer. Hawq: Hes-
+      sian aware quantization of neural networks with mixed-precision. In International Conference
+      on Computer Vision, 2019.
+
+ [6] Zhen Dong, Zhewei Yao, Daiyaan Arfeen, Amir Gholami, Michael W. Mahoney, and Kurt
+      Keutzer. Hawq-v2: Hessian aware trace-weighted quantization of neural networks. In Confer-
+      ence on Neural Information Processing Systems, 2020.
+
+ [7] Elias Frantar, Sidak Pal Sing, and Dan Alistarh. Optimal brain compression: A framework
+      for accurate post-training quantization and pruning. In Conference on Neural Information
+      Processing Systems, 2022.
+
+ [8] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Optq: Accurate quan-
+      tization for generative pre-trained transformers. In International Conference on Learning
+      Representations, 2023.
+
+ [9] Itay Hubara, Yury Nahshan, Yair Hanani, Ron Banner, and Daniel Soudry. Accurate post
+      training quantization with small calibration sets. In International Conference on Machine
+      Learning. PMLR, 2021.
+
+[10] Yongkweon Jeon, Chungman Lee, Eulrang Cho, and Yeonju Ro. Mr.biq: Post-training non-
+      uniform quantization based on minimizing the reconstruction error. In Conference on Computer
+      Vision and Pattern Recognition, 2022.
+
+[11] Yanjing Li, Sheng Xu, Baochang Zhang, Xianbin Cao, Peng Gao, and Guodong Guo. Q-vit:
+      Accurate and fully quantized low-bit vision transformer. In Conference on Neural Information
+      Processing Systems, 2022.
+
+[12] Yuhang Li, Ruihao Gong, Xu Tan, Yang Yang, Peng Hu, Qi Zhang, Fengwei Yu, Wei Wang,
+      and Shi Gu. Brecq: Pushing the limit of post-training quantization by block reconstruction. In
+      International Conference on Learning Representations, 2021.
+
+[13] Yijian Liu, Huanrui Yang, Zhen Dong, Kurt Keutzer, Li Du, and Shanghang Zhang. Noisyquant:
+      Noisy bias-enhanced post-training activation quantization for vision transformers. In Conference
+      on Computer Vision and Pattern Recognition, 2023.
+
+[14] Zhenhua Liu, Yunhe Wang, Kai Han, Wei Zhang, Siwei Ma, and Wen Gao. Post-training
+      quantization for vision transformer. In Conference on Neural Information Processing Systems,
+      2021.
+
+[15] Eric Lybrand and Rayan Saab. A greedy algorithm for quantizing neural networks. In Journal
+      of Machine Learning Research, 2021.
+
+                                                          11
+[16] Mitchell Marcus, Grace Kim, Mary Ann Marcinkiewicz, Robert MacIntyre, Ann Bies, Mark
+      Ferguson, Karen Katz, and Britta Schasberger. The Penn Treebank: Annotating predicate argu-
+      ment structure. In Human Language Technology: Proceedings of a Workshop held at Plainsboro,
+      New Jersey, March 8-11, 1994, 1994. URL https://aclanthology.org/H94-1020.
+
+[17] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture
+      models. arXiv preprint arXiv:1609.07843, 2016.
+
+[18] Nasrin Mostafazadeh, Nathanael Chambers, Xiaodong He, Devi Parikh, Dhruv Batra, Lucy
+      Vanderwende, Pushmeet Kohli, and James Allen. A corpus and cloze evaluation for deeper
+      understanding of commonsense stories. In Proceedings of the 2016 Conference of the North
+      American Chapter of the Association for Computational Linguistics: Human Language Tech-
+      nologies, pages 839-849, San Diego, California, June 2016. Association for Computational
+      Linguistics. doi: 10.18653/v1/N16-1098. URL https://aclanthology.org/N16-1098.
+
+[19] Markus Nagel, Mart van Baalen, Tijmen Blankevoort, and Max Welling. Data-free quantization
+      through weight equalization and bias correction. In International Conference on Computer
+      Vision, 2019.
+
+[20] Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Christos Louizos, and Tijmen Blankevoort.
+      Up or down? adaptive rounding for post-training quantization. In International Conference on
+      Machine Learning, pages 7197-7206. PMLR, 2020.
+
+[21] Denis Paperno, Germán Kruszewski, Angeliki Lazaridou, Ngoc Quan Pham, Raffaella Bernardi,
+      Sandro Pezzelle, Marco Baroni, Gemma Boleda, and Raquel Fernández. The LAMBADA
+      dataset: Word prediction requiring a broad discourse context. In Proceedings of the 54th Annual
+      Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages
+      1525-1534, Berlin, Germany, August 2016. Association for Computational Linguistics. doi:
+      10.18653/v1/P16-1144. URL https://aclanthology.org/P16-1144.
+
+[22] Gunho Park, Baeseong Park, Minsub Kim, Sungjae Lee, Jeonghoon Kim, Beomseok Kwon,
+      Se Jung Kwon, Byeongwook Kim, Youngjoo Lee, and Dongsoo Lee. Lut-gemm: Quantized
+      matrix multiplication based on luts for efficient inference in large-scale generative language
+      models. arXiv preprint arXiv:2206.09557, 2023.
+
+[23] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan,
+      Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas
+      Köpf, Edward Yang, Zach DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy,
+      Benoit Steiner, Lu Fang, Junjie Bai, and Soumith Chintala. Pytorch: An imperative style,
+      high-performance deep learning library. In Conference on Neural Information Processing
+      Systems, 2019.
+
+[24] Jain Prateek, Netrapalli Praneeth, and Sanghavi Sujay. Low-rank matrix completion using
+      alternating minimization. In Proceedings of the Forty-fifth Annual ACM STOC, 2013.
+
+[25] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena,
+      Yanqi Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified
+      text-to-text transformer. Journal of Machine Learning Research, 21(140):1-67, 2020. URL
+      http://jmlr.org/papers/v21/20-074.html.
+
+[26] Sandeep Tata and Jignesh M Patel. Piqa: An algebra for querying protein data sets. In
+      International Conference on Scientific and Statistical Database Management, 2003.
+
+[27] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei,
+      Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas
+      Blecher, Cristian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes,
+      Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony
+      Hartshorn, Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian
+      Khabsa, Isabel Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut
+      Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov,
+      Pushkar Mishra, Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein, Rashi Rungta,
+      Kalyan Saladi, Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiao-
+      qing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng
+
+                                                          12
+      Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien
+      Rodriguez, Robert Stojnic, Sergey Edunov, and Thomas Scialom. Llama 2: Open foundation
+      and fine-tuned chat models, 2023.
+[28] Peisong Wang, Qiang Chen, Xiangyu He, and Jian Cheng. Towards accurate post-training
+      network quantization via bit-split and stitching. In International Conference on Machine
+      Learning. PMLR, 2020.
+[29] Xiuying Wei, Yunchen Zhang, Xiangguo Zhang, Ruihao Gong, Shanghang Zhang, Qi Zhang,
+      Fengwei Yu, and Xianglong Liu. Outlier suppression: Pushing the limit of low-bit transformer
+      language models. In Conference on Neural Information Processing Systems, 2022.
+[30] BigScience Workshop, :, Teven Le Scao, Angela Fan, Christopher Akiki, Ellie Pavlick, Suzana
+      Ilic´, Daniel Hesslow, Roman Castagné, Alexandra Sasha Luccioni, and François Yvon et. al.
+      Bloom: A 176b-parameter open-access multilingual language model, 2023.
+[31] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han.
+      Smoothquant: Accurate and efficient post-training quantization for large language models.
+      arXiv preprint arXiv:2211.10438, 2023.
+[32] Zhewei Yao, Zhen Dong, Zhangcheng Zheng, Amir Gholami, Jiali Yu, Eric Tan, Leyuan Wang,
+      Qijing Huang, Yida Wang, Michael W. Mahoney, and Kurt Keutzer. Hawq-v3: Dyadic neural
+      network quantization. In International Conference on Machine Learning. PMLR, 2021.
+[33] Zhewei Yao, Reza Yazdani Aminabadi, Minjia Zhang, Xiaoxia Wu, Conglong Li, and Yuxiong
+      He. Zeroquant: Efficient and affordable post-training quantization for large-scale transformers.
+      In Conference on Neural Information Processing Systems, 2022.
+[34] Zhihang Yuan, Lin Niu, Jiawei Liu, Wenyu Liu, Xinggang Wang, Luzhang Shang, Guangyu
+      Sun, Qiang Wu, Jiaxiang Wu, and Bingzhe Wu. Rptq: Reorder-based post-training quantization
+      for large language models. arXiv preprint arXiv:2304.01089, 2023.
+[35] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen,
+      Christopher Dewan, Mona Diab, Xian Li, Xi Victoria Lin, Todor Mihaylov, Myle Ott, Sam
+      Shleifer, Kurt Shuster, Daniel Simig, Punit Singh Koura, Anjali Sridhar, Tianlu Wang, and Luke
+      Zettlemoyer. Opt: Open pre-trained transformer language models, 2022.
+
+                                                          13
+A Checklist
+
+A.1 Broader Impacts
+
+Our work pushes the quantization of large language models into the 2 bits per weight regime. Our aim
+is to drive foundational research on theoretical and empirical aspects of quantization. The ultimate
+goal is to enable more powerful LLMs to run more efficiently. However our work is unaware to what
+ends those LLMs are used.
+
+A.2 Limitations
+
+The adaptive rounding [3] proxy objective considers each layer in isolation; it remains to be seen
+what other computationally tractable proxies could improve quantization. For example quantization
+methods do exist which consider interactions between layers, but so far have been too computationally
+expensive to be applied to the largest open LLMS.
+
+A.3 Experiments, Reproducibility
+
+Our code is included in the Supplement. See the included README for instructions on how to
+reproduce the various experiments, including random seeds. The code also downloads all datasets
+used to quantize or evaluate the models.
+
+B Additional Method Clarifications
+
+B.1 Subsection 4.2 (Incoherence-Based Heuristics)
+
+Line 4 diagonally rescales W and H to minimize (W^ )  tr (H) W 2F , effectively trading off
+the spectrum of these matrices to find a minimum. Note to minimize tr D-1HD-1 W D2F =
+   i=1 n Hii/Di2)(  n
+(                   i=1  Di2Wi2)  implies  that  Di  =    Hii/Wi. Motivated by the incoherence of
+
+W , Line 6 computes the quantization range depending on the spectrum W F , instead of the typical
+
+maxi,j |Wij|. The parameter  controls the quantization range; we tune it and find that a value of 2.4
+
+works well across all our experiments. We use  = 2.4 consistently across all experiments. Our full
+
+QuIP procedure is described in Algorithm 3, which contains calls to the pre- and post-processing
+
+sub-steps in Algorithms 1 and 2.
+
+B.2 Subsection 4.2 (Greedy Updates)
+
+In this subsection, we describe the "greedy local search" method mentioned in the main body of
+the paper in more detail. The basic idea is to iterate over coordinates of the weights in the same
+order as the initial quantization method, modifying each weight in turn--but still restricting it to be a
+representable quantized value--so as to minimize the proxy loss while keeping the other weights
+fixed. These greedy updates amount to coordinate descent on the proxy loss, but restricted to the
+quantization grid. Greedy updates can be performed after any initial quantization method, or as a
+standalone method. When performed after an initial quantization method, greedy local search is a
+descent method because the individual weight updates cannot increase the loss, but when performed
+alone, these greedy updates are not a descent method because the initial point (W^ = W ) is not
+feasible because it contains unquantized values that are off the representable quantization grid.
+Concretely, a greedy update of weight (i, j) to the grid {0, 1, . . . , 2b - 1} does the following, where
+ is the proxy loss:
+
+                    W^ ij  arg    min                (W^  -  e  i  e  T  W^  ij  +  ei  e  T  z  ).
+                                  z {0,1,...,2b -1}                   j                    j
+
+(Note that W^ - eieTj W^ ij + eieTj z is the result of setting the (i, j)th entry of W^ to z.) A full pass
+of greedy updates constitutes mn of these updates performed in the same order as LDLQ. This
+
+algorithm is very simple, since it is just greedy coordinate descent. In the rest of this subsection, we
+
+will give a bit more intuition about this method by showing how this greedy algorithm falls within
+
+our framework of adaptive rounding with linear feedback.
+
+                                                 14
+Algorithm 4 Greedy Updates: A Single Pass
+
+Require: b  N, H  Rn×n SPD, weights W  Rm×n, initial guess W~
+ 1: W^  W~
+
+2: U  (H  M ) diag(H)-1                                                            M is the strictly upper triangular mask
+
+3: V  W - (W~ - W )(H  M T ) diag(H)-1                                          can skip if W~ = W by setting V  W
+
+4: for k  {1, . . . , n} do W^ k  clamp(Qnear(Vk + (W - W^ )Uk), 0, 2b - 1)
+
+5: return W^
+
+An application of greedy local search as a single-pass stand-alone method falls under our Adaptive
+Rounding with Linear Feedback framework, with the linear feedback set to U = (HM ) diag(H)-1,
+
+where M is the strictly upper triangular mask and  denotes the Hadamard (entrywise) product,
+as we will derive below. For ease of explanation consider a single (row) weight vector w  R1×n.
+When looking only at column j, the proxy loss from setting w^j to z is
+
+            (w^  -  w^ej eTj  +  z  e  T  )  =  (w^  -  w)H (w^   -  w)T       +     2(zeTj    -    w^    ej  e  T  )H  (  w^  -  w)T
+                                       j                                                                         j
+
+                                                        +  (zeTj  -  w^  e  j  e  T  )  H  (z  ejT  -     w^  ej  e  T  )T  .
+                                                                                  j                                  j
+
+This is just a quadratic function in z, and so its minimum value on the grid {0, 1, . . . , 2b - 1} will
+
+just be its minimum value on R rounded to that grid. To find this minimum over R, we differentiate
+to minimize, yielding
+
+                              0  =     2eTj H(w^     -  w)T  +    2ejT H(zejT           -  w^  ej   e  T  )T  ,
+                                                                                                       j
+
+and solving for z,
+
+                                    (w^ - w^ejeTj - w)Hej                                  (w^ - w)Hej
+                    z = - ejT Hej = w^ej - ejT Hej . (8)
+
+Since when we use greedy local search as a stand-alone method, we have not updated w^j yet, at this
+point w^ej = wej, and so this means that a single step of greedy updates looks like
+
+                                                                              H ej
+                                          w^ej  Q wej - (w^ - w) T
+
+                                                                            ej Hej
+
+for Q referring to nearest rounding with the necessary clamping. Since w^ - w is zero for all entries
+following the jth one, this is equivalent to
+
+                                             w^ej  Q(wej - (w^ - w)U ej)
+
+where U is set as U = (H  M ) diag(H)-1 as above. This shows how this single-pass version of
+greedy updates fits into our adaptive rounding with linear feedback framework.
+
+Analyzing greedy local search as a post-processing pass is a bit more difficult, but we will see that it
+
+can also be written as something like adaptive rounding with linear feedback. Suppose that we do a
+
+pass of greedy updates, but our quantized weights start at an initial value w^ = w~ already quantized
+
+from some previous method (e.g. LDLQ). Returning to (8), since we haven't updated w^j yet, we'll
+
+have                                                         (w^ - w)Hej
+
+                                                z = w~ej - T                            .
+                                                                     ej Hej
+
+Now, all the entries of w^ which come after j are still the ones from w~. This means that we can split
+
+this up as
+
+                 z = wej -       (w^ - w):,1:(j-1)H1:(j-1),j + (w~ - w):,(j+1):nH(j+1):n,j
+
+                                                                     ej HejT
+
+where the first part of this sum comes from the entries which we may have already updated during
+
+this pass, the second comes from the entries which are still equal to their initial values in w~, and the
+
+case of wj is handled specially, cancelling it with the w~ej term. We can write this more compactly in
+
+matrix form as                               (w^ - w)(H  M )ej + (w~ - w)(H  M T )ej
+
+                    z = wej -                                        ej HejT                                            ,
+
+                                                             15
+  Model   Processing      Absolute      Approximate                    tr (D) / tr (H)
+OPT-125m              Fractional Rank  Fractional Rank
+OPT-350m   Baseline                                                    0.540 (±0.093)
+OPT-1.3b  Incoherent  0.926 (±0.172)   0.112 (±0.127)                  0.534 (±0.094)
+OPT-2.7b              0.910 (±0.196)   0.124 (±0.141)
+           Baseline                                                    0.445 (±0.100)
+          Incoherent  0.916 (±0.180)   0.047 (±0.032)                  0.440 (±0.106)
+                      0.908 (±0.183)   0.059 (±0.062)
+           Baseline                                                    0.399 (±0.187)
+          Incoherent  0.541 (±0.404)   0.020 (±0.023)                  0.393 (±0.189)
+                      0.543 (±0.405)   0.028 (±0.023)
+           Baseline                                                    0.384 (±0.206)
+          Incoherent  0.426 (±0.413)   0.019 (±0.015)                  0.375 (±0.205)
+                      0.427 (±0.415)   0.018 (±0.025)
+
+Table 6: We compute H in each layer of a given model, and compute the following summary
+statistics. tr (D) / tr (H) decreases as the mode size increases, though the variance also increases.
+We compute the fraction of nonzero eigenvalues (i.e. absolute), and the fraction of eigenvalues
+> 0.01 · max(eig(H)) (i.e. approximate). The fractional rank is k/n for a rank-k matrix H with
+dimension n. Mean and standard deviations are computed across layers in a model.
+
+where M is the strictly upper triangular mask and  is elementwise multiplication. This yields a final
+quantization step of
+
+                      (H  M T )ej                                      H ej
+w^ej  Q wej - (w~ - w) T               - (w^ - w) T                          .
+                      ej Hej                                       ej Hej
+
+So, more generally, if we define U as above, and set
+                                V = W - (W~ - W )(H  M T ) diag(H)-1,
+
+we can write a single pass of greedy updates in matrix form as
+                                          W~  Q(V + (W - W^ )U ),
+
+which is very close to our rounding with linear feedback form, albeit with the difference that here V
+is in place of W . This is made explicit in the included Greedy Updates Algorithm.
+
+We can use this algorithm both as a whole quantization method (by setting W~ = W ) or as a post-
+processing step (by setting W~ to the output of some other initial quantization algorithm, such as
+LDLQ). When we do use it as a post-processing step, we typically run multiple passes of greedy
+updates (e.g. 10 passes): this involves passing the output of the greedy updates algorithm back in as
+the input guess W~ to another run of the greedy updates algorithm, and repeating this multiple times.
+
+C Additional Experimental Descriptions and Results
+
+C.1 Subsections 3.2 and 3.3 (Empirical Properties of H Across OPT-125m to 2.7b)
+
+Interpreting the exact proxy loss of LDLQ and nearest rounding by empirically comparing
+tr (D) vs tr (H). Theorem 1 gives the average-case proxy loss for LDLQ in terms of tr (D), where
+D is from the LDL decomposition of H. Lemma 3 gives the average-case proxy loss for standard
+nearest rounding in terms of tr (H). We know that LDLQ is better in practice, but comparing these
+equations is difficult because we need to reason about tr (D) vs tr (H). Our paper resolves this
+difficulty by deriving bounds on the proxy loss for LDLQ in terms of the spectrum of H (with
+and without incoherence). However we also perform a quick empirical check: if tr (D)  tr (H),
+then our theory explains the empirical superiority of LDLQ over nearest rounding (at least on these
+models). Table 6 gives the ratio tr (D) / tr (H) across all layers for OPTQ models 125m to 2.7b; the
+mean value is always less than 0.55, and it falls as the model gets larger.
+
+H is approximately low-rank. Subsection 3.3 plotted the normalized eigenvalues of H from 3
+randomly chosen layers in OPT-2.7b. Table 6 gives much more evidence that H is consistently ap-
+proximately low-rank. Across each model, we calculate the absolute and approximate fractional rank
+
+                      16
+of H across all layers in OPT models 125m to 2.7b (explanations in the caption). The approximate
+fractional rank decreases as model size increases; for OPT-2.7b the fractional rank is  0.02(±0.02).
+
+C.2 Subsection 5.1 (Empirical Verification of OPTQ Equivalence)
+
+We share a python script in the supplementary code which empirically verifies that our implementation
+of LDLQ produces quantized values exactly matching OPTQ's [1] implementation. While we prove
+the equivalence between LDLQ and OPTQ's respective algorithm statements, empirically comparing
+ours and Frantar et al. [1]'s code ensures that the respective implementations are sufficiently close to
+their algorithmic statements. Therefore we can be sure that LDLQ and OPTQ are equivalent in their
+implementation.
+
+C.3 Subsection 5.2 (Empirical Verification of LDLQ/OPTQ Finite Grid Counterexample)
+
+The following code constructs a weight matrix W and Hessian matrix H where OPTQ performs
+worse than nearest when rounding to a finite grid.
+
+1 import torch
+
+2 def make_counterexample(n, d, c=0.01):
+
+3   H = torch.ones(n,n) + torch.eye(n)
+
+4   H[n-1,n-1] = 1.0
+
+5   H[0,1:(n-1)] += 2 * c
+
+6   H[1:(n-1) ,0] += 2 * c
+
+7   H[0,n-1] += c
+
+8   H[n-1,0] += c
+
+9   H[0,0] += 4 * c + n * (c**2)
+
+10  W = 0.499 * torch.ones(d,n) + 0.002 * (torch.arange(n) % 2)
+
+11  return W, H
+
+The intuition behind this counterexample is as follows: we want to quantize many coordinates in
+W in such a way that OPTQ excepts there to be a very large error correction to quantize the last
+entry. However, the finite grid restricts this large error correction. Note that we can achieve this poor
+OPTQ behavior with c=0, but here nearest rounding also does poorly. We make a small perturbation
+(c=0.01) to make OPTQ round in the wrong direction, but not nearest.
+
+C.4 Additional Details on the Experimental Setup and Computational Resources
+
+We run experiments on a university cluster managed by a Slurm workload manager which has GPUs
+with up to 48GB of memory, though larger GPUs are only required for some methods on larger model
+sizes. Note we use the LAMBADA OpenAI version. When Greedy updates are used, we perform
+10 passes over the weights in the same order as LDLQ and OPTQ, except for 5 passes on OPT-30b
+and OPT-66b. For the incoherence-based quantization range, we tune the parameter  and find that a
+value of 2.4 works well across all model sizes and quantization methods. We use this value for all our
+experiments.
+
+C.5 Section 6 (Main Results on Additional Evaluations)
+
+Figure 6 shows additional results for QuIP and OPTQ on WikiText2, PiQA, and StoryCloze when
+quantizing to 2 and 3 bits per weight. The insights about our method QuIP remain the same after
+viewing these additional results: QuIP is the first PTQ procedure to achieve good quantization at two
+bits per weight, across a variety of LLM sizes and evaluation tasks. We evaluate on OPT models (up
+to 30B); 4-bit quantization works equally well for both methods. QuIP is superior to OPTQ across
+model sizes and evaluation tasks here.
+
+On WikiText2 2-bit quantization, note that the trend in perplexity for QuIP mirrors the trend in
+perplexity for OPTQ. We run OPTQ's [1] implementation, though they did not report 2-bit results
+at this model size. Because OPTQ is equivalent to QuIP's quantization sub-procedure, it thus
+makes sense that worse performance in the quantization sub-procedure could result in worse overall
+performance. OPTQ increases perplexity when going from OPT-1.3b to OPT-2.7b. QuIP's perplexity
+also increases from OPT-1.3b to OPT-2.7b, and is unusually higher than the adjacent OPT-1.3b and
+
+                                  17
+                               FP16          OPTQ-W3  OPTQ-W2               QuIP-W3                    QuIP-W2
+
+104Perplexity on WikiText2                  0.80                                                     0.75
+                                      Accuracy on PiQA0.75                                           0.70
+103                                         0.70                                                     0.65
+                                                                             Accuracy on StoryCloze0.650.60
+102                                         0.60                                                     0.55
+         100           101                  0.55      100             101                            0.50       100    101
+101      # params in billions               0.50      # params in billions                                      # params in billions
+   10 1                                                                                                 10 1
+                                               10 1
+
+Figure 6: Quantizing OPT models up to 66B parameters. Additional evaluation tasks shown here in
+the Supplement. Our method QuIP is the first PTQ procedure to achieve good quantization at 2 bits
+per weight, across a variety of model sizes and evaluation tasks. Note the drop in performance for
+OPTQ on OPT-66B is documented in their paper.
+
+OPT-6.7b models. However QuIP still beats OPTQ in this setting. Our observations about OPTQ and
+QuIP on WikiText2 and OPT-2.7b were consistent across multiple independent runs.
+
+C.6 Section 6 (All Methods, All Model Sizes, All Bit Weights, All Evaluation Tasks)
+
+Tables 7-13 provide results on all combinations of the following: methods, model sizes (OPT 125m-
+30b), bit weights(4,3,2), and evaluation tasks. Across our extensive array of experiments, we see that
+incoherence processing always enables a step function change in quantization at 2 bits.
+
+                                            Incoherence Processing -- OPT-30b
+
+         Full          QuIP                           QuIP-RG               Greedy+IncP                                Near+IncP
+
+Wiki     W16     W4     W3            W2     W4        W3       W2          W4        W3              W2         W4     W3             W2
+PTB
+C4       9.56   9.60   9.79          11.48  9.66      9.75     11.68       9.72      9.92            11.59      9.77   9.89           12.04
+ArcE     14.04  14.18  14.37         17.40  14.11     14.44    16.94       14.23     14.45           17.39      14.16  14.49          18.12
+LAMB     11.45  11.50  11.66         13.55  11.51     11.68    13.44       11.52     11.71           13.30      11.53  11.74          14.11
+PiQA     65.40  65.32  65.28         57.87  64.86     63.51    59.51       65.99     63.80           58.80      64.06  64.06          56.36
+SC       72.40  73.20  72.68         65.24  71.86     71.53    62.31       71.71     71.38           64.47      71.41  71.41          60.64
+         78.13  78.45  78.73         75.24  78.51     78.73    76.17       77.86     77.58           75.95      78.24  77.53          75.46
+         77.28  76.96  76.51         73.39  77.02     77.08    73.01       76.70     76.64           73.33      76.77  75.94          71.93
+
+                                            Baseline Processing -- OPT-30b
+
+         Full          OPTQ                           LDLQ-RG                        Greedy                            Near
+
+Wiki     W16     W4     W3            W2     W4        W3       W2          W4        W3              W2         W4     W3             W2
+PTB
+C4       9.56   9.59   10.32         71.70  9.64      10.31    49.40       9.69      13.63           4,817      10.77  1,565          41,548
+ArcE     14.04  14.22  15.36         88.19  14.20     15.15    73.45       14.33     23.05           3,474      15.41  1,526          34,349
+LAMB     11.45  11.56  12.23         29.59  11.56     12.15    29.12       11.59     16.30           3,183      13.52  1,808          24,816
+PiQA     65.40  64.77  60.19         42.47  63.76     63.43    41.20       63.09     50.51           26.30      61.28  34.47          25.80
+SC       72.40  72.39  68.89         25.77  71.94     69.78    26.35       72.37     56.76           00.00      70.42  01.73          00.00
+         78.13  78.56  78.02         66.05  78.56     77.80    64.58       78.35     70.46           49.89      77.02  56.37          49.56
+         77.28  77.53  75.62         63.59  76.89     75.56    63.53       76.45     68.43           48.31      75.24  49.59          48.57
+
+Table 7: Quantizing OPT-30b with all combinations of quantization and pre-post processing methods,
+evaluating on language generation and zeroshot tasks. Our incoherence processing enables a step
+function change in quantization at 2 bits, across all rounding methods.
+
+                                                      18
+                                   Incoherence Processing -- OPT-13b
+
+      Full          QuIP                  QuIP-RG                 Greedy+IncP            Near+IncP
+
+Wiki  W16     W4     W3     W2      W4     W3       W2      W4     W3      W2      W4     W3         W2
+PTB
+C4    10.13  10.21  10.5   16.02   10.35  10.69    13.81   10.25  10.61   13.91   10.34  10.59      16.12
+ArcE  14.52  14.69  15.05  21.64   14.73  15.20    22.23   14.85  15.11   20.20   14.93  15.27      23.18
+LAMB  12.06  12.16  12.39  16.60   12.18  12.43    15.62   12.21  12.42   15.19   12.26  12.56      17.37
+PiQA  61.78  61.41  59.47  53.91   60.35  61.78    52.86   60.10  59.43   53.79   60.56  59.30      50.00
+SC    70.25  72.09  71.10  56.24   69.47  69.07    55.70   70.83  68.43   56.98   68.37  67.86      46.48
+      76.82  76.61  76.17  72.52   76.55  76.22    72.74   76.33  76.17   71.87   75.08  76.66      70.73
+      76.58  75.62  74.92  70.21   75.88  75.75    70.53   75.43  75.62   72.50   74.47  75.43      68.43
+
+                                   Baseline Processing -- OPT-13b
+
+      Full          OPTQ                  LDLQ-RG                 Greedy                 Near
+
+Wiki  W16     W4     W3     W2      W4     W3       W2      W4     W3      W2      W4     W3      W2
+PTB
+C4    10.13  10.31  11.60  372.68  10.28  11.54    213.75  10.73  13.67   8,370   11.33  3,333  186,069
+ArcE  14.52  14.91  16.59  344.44  14.85  16.43    220.38  15.25  18.62   7,053   16.40  2,708  121,291
+LAMB  12.06  12.26  13.34  135.48  12.24  13.17    67.48   12.55  14.30   4,316   13.32  2,711  93,834
+PiQA  61.78  64.77  60.19  42.47   60.77  58.54    32.07   56.61  51.22   25.38   61.32  31.10   25.42
+SC    70.25  72.39  68.89  25.77   68.72  65.30            68.12  59.36   00.02   67.22  00.06   00.00
+      76.82  78.56  78.02  66.05   76.28  75.08     6.58   76.50  73.45   50.98   76.06  53.10   49.62
+      76.58  77.53  75.62  63.59   76.32  73.52    59.09   75.68  72.44   49.40   74.41  49.71   48.70
+                                                   56.33
+
+Table 8: Quantizing OPT-13b with all combinations of quantization and pre-post processing methods,
+evaluating on language generation and zeroshot tasks. Our incoherence processing enables a step
+function change in quantization at 2 bits, across all rounding methods.
+
+                                   Incoherence Processing -- OPT-6.7b
+
+      Full          QuIP                  QuIP-RG                 Greedy+IncP            Near+IncP
+
+Wiki  W16     W4     W3     W2      W4     W3       W2      W4     W3      W2      W4     W3         W2
+PTB
+C4    10.86  10.98  11.51  22.33   11.20  11.61    23.75   11.13  11.62   19.06   11.18  11.73      18.57
+ArcE  15.77  15.93  16.52  31.73   15.99  16.43    45.53   15.88  16.50   35.94   16.06  16.47      27.04
+LAMB  12.71  12.86  13.30  21.62   12.88  13.39    24.98   12.89  13.27   19.62   12.96  13.37      19.15
+PiQA  60.06  59.89  59.60  52.61   59.30  58.21    53.32   59.18  58.25   51.43   59.85  57.62      50.59
+SC    68.72  70.00  68.74  53.97   67.38  65.77    49.91   67.65  67.18   54.80   67.26  65.86      49.49
+      76.55  76.77  76.33  72.47   76.71  76.33    72.91   76.39  75.46   72.20   76.55  76.71      71.22
+      74.47  75.18  73.65  68.43   75.05  73.33    69.51   74.35  73.77   68.94   74.22  74.09      68.75
+
+                                   Baseline Processing -- OPT-6.7b
+
+      Full          OPTQ                  LDLQ-RG                 Greedy                 Near
+
+Wiki  W16     W4     W3     W2      W4     W3       W2      W4     W3      W2      W4     W3         W2
+PTB
+C4    10.86  11.49  14.87  2,958   11.23  12.56    739.9   11.75  39.09   16,298  12.15  6,011      20,780
+ArcE  15.77  16.54  22.05  2,521   16.28  18.58    1,109   16.93  66.57   10,708  18.92  5,440      14,217
+LAMB  12.71  13.16  17.13  500.7   12.98  14.34    154.0   13.27  37.13   9,968   14.40  5,225      12,419
+PiQA  60.06  58.84  53.41  31.86   59.18  55.26    33.00   54.63  32.49   26.09   58.75  25.42      25.80
+SC    68.72  66.18  52.36  01.07   67.46  61.89    01.79   66.19  02.56   00.00   64.53  00.00      00.00
+      76.55  76.01  73.23  55.11   76.77  74.48    54.46   74.48  53.59   51.90   76.28  50.71      49.78
+      74.47  73.71  71.42  52.07   74.09  72.37    52.45   72.82  50.99   49.40   73.58  47.87      47.80
+
+Table 9: Quantizing OPT-6.7b with all combinations of quantization and pre-post processing
+methods, evaluating on language generation and zeroshot tasks. Our incoherence processing enables
+a step function change in quantization at 2 bits, across all rounding methods.
+
+C.7 Section 6 (Evaluating the Effectiveness of the Proxy Objective)
+
+In Table 14 we show the proxy loss of the four quantization methods we evaluate, evaluated over
+OPT models 125m to 2.7b. The proxy is averaged over models proxy losses normalized by their
+model dimension; we use H matrices computed as a result of OPTQ and nearest rounding. We do not
+conduct any processing in the proxy evaluation; this is an evaluation of the rounding methods only.
+Trends in the proxy reflect end-to-end results. OPTQ/LDLQ, LDLQ-RG, and Greedy are roughly
+equivalent at 2 bits, and do better than Nearest.
+
+C.8 Section 6 (Evaluating Unbiased Rounding in LDLQ/OPTQ)
+
+Note in our formulation for Adaptive Rounding with Linear feedback, the Q subroutine could be
+biased, or unbiased. It is typical to perform biased rounding in practice; here we investigate if there is
+
+                                                          19
+                                  Incoherence Processing -- OPT-2.7b
+
+      Full          QuIP                 QuIP-RG         Greedy+IncP                  Near+IncP
+
+Wiki  W16     W4     W3     W2     W4     W3       W2     W4     W3      W2     W4     W3         W2
+PTB
+C4    12.47  12.39  17.44  2,998  12.58  15.07    1,676  12.68  12.96   155.6  12.79  13.79      28.98
+ArcE  17.97  18.42  20.79  63.59  18.43  20.49    42.05  18.34  20.03   46.28  18.43  19.51      39.23
+LAMB  14.34  14.55  15.63  38.07  14.65  15.97    27.89  14.64  15.22   26.84  14.67  15.52      27.34
+PiQA  54.34  53.28  52.99  46.93  52.02  52.36    46.93  52.90  51.73   43.14  52.61  50.93      44.11
+SC    64.82  66.04  64.99  36.06  64.64  63.46    43.39  64.68  62.95   45.53  65.40  61.05      35.65
+      74.76  74.54  73.94  68.06  73.88  73.45    68.28  74.54  73.83   68.28  73.61  73.56      67.85
+      71.74  71.80  70.21  66.14  71.55  70.15    64.67  70.85  71.10   65.82  71.16  70.02      63.27
+
+                                  Baseline Processing -- OPT-2.7b
+
+      Full          OPTQ                 LDLQ-RG                Greedy                Near
+
+Wiki  W16     W4     W3     W2     W4     W3       W2     W4     W3      W2     W4     W3         W2
+PTB
+C4    12.47  12.93  17.09  8,949  12.77  16.47    7,718  12.95  18.92   9,665  16.69  15,685     10,641
+ArcE  17.97  19.10  25.36  8,281  19.05  23.94    7,389  19.06  28.75   8,254  32.22  14,532     10,516
+LAMB  14.34  14.99  18.14  4,388  14.85  17.37    2,113  15.01  20.87   5,139  18.75  11,257     9,356
+PiQA  54.34  52.57  50.04  26.94  52.02  48.95    25.76  52.02  43.39   25.46  52.74  26.56      27.19
+SC    64.82  62.00  51.43  00.00  64.04  53.25    00.00  63.50  40.75   00.00  59.15  00.00      00.00
+      74.76  73.88  70.73  48.42  74.54  69.91    49.95  73.61  66.05   50.65  73.83  51.41      50.22
+      71.74  70.91  68.56  48.50  71.42  67.79    47.17  70.66  60.53   48.44  70.59  47.42      47.55
+
+Table 10: Quantizing OPT-2.7b with all combinations of quantization and pre-post processing
+methods, evaluating on language generation and zeroshot tasks. Our incoherence processing enables
+a step function change in quantization at 2 bits, across all rounding methods.
+
+                                  Incoherence Processing -- OPT-1.3b
+
+      Full          QuIP                 QuIP-RG         Greedy+IncP                  Near+IncP
+
+Wiki  W16     W4     W3     W2     W4     W3       W2     W4     W3      W2     W4     W3         W2
+PTB
+C4    14.62  14.88  16.21  41.64  16.49  17.76    42.37  16.75  17.11   48.69  16.43  17.83      56.56
+ArcE  20.29  20.87  22.76  47.72  21.93  23.25    50.17  22.11  23.76   54.46  22.19  24.82      80.40
+LAMB  16.07  16.38  17.12  29.78  17.53  18.44    31.49  17.60  18.54   34.10  17.74  19.03      45.56
+PiQA  50.84  50.72  49.12  41.88  49.54  48.82    41.20  49.66  48.74   41.08  48.61  46.59      38.64
+SC    58.92  56.36  52.47  27.81  51.62  48.36    27.27  49.95  48.38   19.21  49.76  51.12      20.20
+      72.31  71.22  71.11  64.85  71.06  70.24    63.33  71.00  70.35   63.66  71.16  69.80      62.51
+      70.78  70.08  68.81  63.02  69.00  68.05    63.14  68.49  67.92   62.64  69.13  67.79      58.43
+
+                                  Baseline Processing -- OPT-1.3b
+
+      Full          OPTQ                 LDLQ-RG                Greedy                Near
+
+Wiki  W16     W4     W3     W2     W4     W3       W2     W4     W3      W2     W4     W3         W2
+PTB
+C4    14.62  15.59  21.35  7,856  15.36  20.22    7,739  15.58  22.68   9,786  47.62  12,658     11,690
+ArcE  20.29  22.03  30.74  6,858  21.85  30.10    5,368  22.00  35.18   8,441  73.51  14,705     11,690
+LAMB  16.07  16.96  21.59  4,028  16.70  20.21    2,123  16.96  22.11   5,129  27.20  6,415      8,360
+PiQA  50.84  49.33  45.58  25.46  48.95  45.41    26.68  48.19  42.42   26.01  42.80  27.82      25.13
+SC    58.92  57.03  37.32  00.00  58.45  41.08    00.02  59.15  40.97   00.00  36.91  00.00      00.00
+      72.31  70.73  68.66  49.73  70.40  67.95    52.18  70.67  66.43   50.87  67.74  51.41      49.78
+      70.78  70.15  65.18  48.38  70.34  66.45    49.27  70.40  64.48   48.76  59.13  47.87      48.25
+
+Table 11: Quantizing OPT-1.3b with all combinations of quantization and pre-post processing
+methods, evaluating on language generation and zeroshot tasks. Our incoherence processing enables
+a step function change in quantization at 2 bits, across all rounding methods.
+
+any benefit to switching to unbiased rounding schemes. Table 15 computes the average perplexity
+difference (i.e. unbiased - biased) for LDLQ/OPTQ on WikiText2, PTB, and C4. That is, we run
+LDLQ with the Q subroutine as stochastic rounding, instead of nearest. The average difference is
+positive (and large for 2 and 3 bits), meaning that unbiased rounding performs worse than biased (i.e.
+nearest) across OPT models 125m to 2.7b. These results indicate that in practice, we want to stick
+with biased rounding schemes.
+
+C.9 Section 6 (Evaluating Algorithm 5 Which Accounts for Clamping)
+
+Table 16 shows results from using Algorithm 5 to quantize OPT models 125m to 1.3b, with incoher-
+ence processing and baseline processing. At 2 bits and incoherence processing, we observe modest
+improvements over QuIP in terms of perplexity on OPT models 125m and 350m. However, at the
+
+                                                          20
+                                      Incoherence Processing -- OPT-350m
+
+      Full             QuIP                  QuIP-RG                 Greedy+IncP                Near+IncP
+
+Wiki  W16     W4        W3     W2      W4     W3       W2      W4     W3      W2          W4     W3         W2
+PTB
+C4    22.00  22.5      25.19  672.3   23.57  25.54    418.0   23.14  25.38   239.9       23.41  27.86      1,444
+ArcE  31.07  32.57     35.65  744.2   32.46  37.00    587.4   33.10  37.07   301.0       33.32  39.49      1,354
+LAMB  22.59  23.23     25.48  320.0   23.45  25.50    215.4   23.43  25.48   124.1       23.81  27.41      880.2
+PiQA  40.36  39.44     38.13  27.44   39.31  38.47    29.67   39.77  40.24   30.64       38.89  38.76      28.41
+SC    46.67  46.89     42.03  01.03   43.04  39.80    04.99   42.44  40.62   06.38       41.47  34.45      00.08
+      64.80  64.47     63.28  50.87   64.25  63.17    54.79   64.42  64.25   55.01       64.15  63.00      52.23
+      63.14  62.13     61.55  53.15   61.74  61.23    51.43   62.83  61.62   53.28       62.38  61.49      50.22
+
+                                        Baseline Processing -- OPT-350m
+
+      Full             OPTQ                  LDLQ-RG                 Greedy                     Near
+
+Wiki  W16     W4        W3     W2      W4     W3       W2      W4     W3      W2          W4     W3         W2
+PTB
+C4    22.00  24.16     33.51  18,687  23.77  31.87    10,446  27.01  137.3   23,952      25.94  64.56      23,668
+ArcE  31.07  34.17     47.69  18,161  33.35  44.38    8,508   40.39  153.5   15,176      36.78  87.22      28,881
+LAMB  22.59  24.71     31.26  8,418   24.10  29.86    3,064   27.84  73.59   9,099       26.21  55.15      17,094
+PiQA  40.36  38.43     38.38  26.30   39.06  37.42    25.46   38.34  31.06   24.33       38.68  36.11      25.88
+SC    46.67  45.60     39.20  00.00   45.26  32.54    00.02   51.45  16.63   00.00       40.66  27.46      00.00
+      64.80  64.04     63.44  51.25   65.13  61.97    49.67   63.49  55.44   50.60       63.38  60.55      51.58
+      63.14  63.78     61.04  47.55   62.57  60.53    48.95   61.36  54.87   48.44       63.02  56.84      48.95
+
+Table 12: Quantizing OPT-350m with all combinations of quantization and pre-post processing
+methods, evaluating on language generation and zeroshot tasks. Our incoherence processing enables
+a step function change in quantization at 2 bits, across all rounding methods.
+
+                                      Incoherence Processing -- OPT-125m
+
+      Full             QuIP                  QuIP-RG                 Greedy+IncP                Near+IncP
+
+Wiki  W16     W4        W3     W2      W4     W3       W2      W4     W3           W2     W4     W3         W2
+PTB
+C4    27.66  33.35     34.22  347.4   31.51  42.94    361.8   30.65  55.54        230.8  31.93  37.57      397.5
+ArcE  38.99  40.80     47.34  430.3   43.28  51.69    414.1   41.96  48.79        250.6  43.08  52.20      441.9
+LAMB  26.56  27.63     30.92  177.4   28.74  33.54    159.0   28.82  31.41        99.01  29.28  33.88      224.0
+PiQA  40.03  38.89     37.92  31.99   39.27  38.26    31.36   38.80  37.67        33.21  38.55  37.42      32.91
+SC    39.16  33.03     26.37  01.05   33.75  16.96    02.17   37.78  25.34        04.66  35.65  25.21      01.82
+      61.92  61.64     61.64  54.24   61.64  61.92    55.44   61.10  60.83        56.47  61.43  61.10      53.48
+      59.96  60.03     59.20  52.13   59.07  59.26    51.94   60.15  59.52        54.04  59.13  58.88      53.41
+
+                                        Baseline Processing -- OPT-125m
+
+      Full             OPTQ                  LDLQ-RG                 Greedy                     Near
+
+Wiki  W16     W4        W3     W2      W4     W3       W2      W4     W3           W2     W4     W3         W2
+PTB
+C4    27.66  31.44     53.26  4,563   32.29  53.25    3,704   77.80  1,791        3,707  37.14  1,293      5,375
+ArcE  38.99  45.31     74.79  4,410   45.56  75.85    3,596   101.1  1,403        4,622  53.93  1,418      4,267
+LAMB  26.56  29.13     42.55  2,260   29.40  41.77    1,820   65.54  809.5        1,897  33.90  836.5      3,665
+PiQA  40.03  38.51     35.73  28.62   39.02  36.36    27.19   34.05  26.43        27.15  36.66  30.39      26.01
+SC    39.16  33.69     12.36  00.00   33.26  15.00    00.00   12.25  00.00        00.00  18.22  00.08      00.00
+      61.92  60.83     59.47  52.23   61.70  59.58    50.05   57.62  49.29        50.49  61.43  55.88      51.20
+      59.96  58.88     56.97  49.78   59.20  57.03    48.95   50.99  47.55        48.82  59.96  50.03      47.93
+
+Table 13: Quantizing OPT-125m with all combinations of quantization and pre-post processing
+methods, evaluating on language generation and zeroshot tasks. Our incoherence processing enables
+a step function change in quantization at 2 bits, across all rounding methods.
+
+             WBits LDLQ/OPTQ LDLQ-RG Greedy Near
+
+                    4         104.09         105.23 120.74 301.18
+
+                    3         529.53         475.25 537.98 1,308.05
+
+                    2         2,554.89       2,291.02 2,587.17 5,971.69
+
+Table 14: Weighted average of proxy Loss tr (W^ - W )H(W^ - W )T over OPT models 125m to
+
+2.7b. Proxy is averaged over models normalized by their model dimension (768, 1024, 2048, 2560)
+respectively, to ensure proxy loss is comparable across models of different size. We do not conduct
+any processing in the proxy evaluation. Trends in the proxy largely reflect end-to-end results: at 2
+bits OPTQ, LDLQ-RG, and Greedy are roughly equivalent, and all do better than nearest.
+
+                                             21
+             AVERAGE(Perplexity Unbiased - Perplexity Biased) on Wiki, PTB, C4 ()
+
+             Incoherence Processing                       Baseline Processing
+
+   WBits 125m 350m 1.3b 2.7b 125m 350m 1.3b                                       2.7b
+
+          4 1.23 0.73 0.79 0.19 27.81 5.58 1.62                                   0.87
+
+          3 13.26 7.79 2.14 4.66 880.4 499.4 28.63                             16.23
+
+          2 2,501 18,732 544.8 2,251 241.3 17,945 4,831                        3,798
+
+Table 15: Average perplexity difference (i.e. unbiased - biased) for LDLQ/OPTQ on WikiText2,
+
+PTB, and C4. That is, we can run LDLQ with the Q subroutine as stochastic rounding, instead of
+
+nearest. The average difference is positive, meaning that unbiased rounding performs worse than
+
+biased (i.e. nearest) across OPT models 125m to 2.7b. Note the magnitude of the gap increases at
+
+lower bits.
+
+                           Incoherence Processing (ours)          Baseline Processing
+
+   Model WBits Wiki PTB                         C4             Wiki  PTB                C4
+
+                      4    16.54   22.12        17.58      15.43      21.92        16.80
+   OPT-1.3b 3              18.27   23.96        18.66      20.45      28.86        20.68
+                           38.13   51.78        31.09     6,438.75   6,099.27     2,057.71
+                      2
+
+                       4   23.19   32.55        23.48      23.71      33.73        24.29
+   OPT-350m 3              25.54   36.74        25.52      33.01      45.15        30.09
+                           286.71  367.26       144.08    8,006.22   7,445.70     2,317.18
+                       2
+
+             4             32.04 44.56 29.08 32.59 41.95 28.67
+
+   OPT-125m 3              40.66 51.90 32.91 50.73 74.14 41.04
+
+             2 1,649.83 240.86 136.55 3,714.11 4,703.76 1,848.72
+
+Table 16: Quantizing OPT models using Algorithm 5 evaluated on WikiText2, PTB, and C4. At 2
+
+bits and incoherence processing, we see improvements over LDLQ and LDLQ-RG on OPT-125m and
+
+OPT-350m, but diminishing improvements on OPT-1.3b. Due to Algorithm 5's relatively equivalent
+
+performance relative to QuIP at OPT-1.3b, and due to this algorithm's increased computational cost,
+
+we decide not to user it.
+
+larger OPT-1.3b QuIP beats Algorithm 5 on 2/3 language generation tasks. In addition, Algorithm 5
+is computationally more work to run. Therefore we decide not to use it.
+
+Another observation: in practice, we don't seem to encounter constructions of W and H that are bad
+for LDLQ/OPTQ. Therefore this "clamping" issue seems to not be an issue in practice, especially as
+model size increases.
+
+D Proofs for Section 3 (Quantization With Incoherence Processing: Adaptive
+     Rounding Step )
+
+Subsection 3.2 (Deriving the Optimality of the LDLQ Adaptive Rounding Procedure)
+
+Theorem 1. LDLQ is worst and average-case optimal amongst rounding methods which specify the
+linear feedback U as a function of H (not of W ), and when rounding to the integers. That is, for all
+rounding methods A in the class described by Eq. (2), for all positive semi-definite H, and for Q as
+either nearest or stochastic rounding,
+
+m  tr(D)  =  Lworst(LDLQ,  H)    Lworst(A,  H)  and  m  tr(D)  =  Lavg(LDLQ,  H)    Lavg(A,  H ),
+4                                                    c
+
+where D is the matrix from the LDL decomposition of H, and c = 12 for nearest, c = 6 for stochastic.
+
+Proof. Let X be the strictly upper triangular matrix associated with the rounding procedure A such
+that U  X in Eq. (2). Let B  (X + I)-1(U` + I) where U` is from the LDL decomposition of H
+
+                                                          22
+in Eq. (4). The proxy loss is then,
+
+                                            T (3),(4)                          -1 `                     `      T               -T T
+tr (A(W, H) - W )H(A(W, H)) = tr (X + I) (U + I)D(U + I) (X + I) 
+
+                                                    = tr BDBT T .                                                                    (9)
+
+With the LDL assignment of U , we further have that,
+
+                                            tr BDBT T = tr DT .                                                                  (10)
+
+First, consider the worst-case loss, Lworst. The goal is to construct a particularly bad case where
+the entries of W~ are 1/2 ± , and thus when rounding to the integers we will always have error 1/2.
+
+Construct a weight matrix W~  Rm×n such that each entry satisfies,
+
+                       Wij =~      0.5 -  w.p. 1/2                     ij =           +0.5 w.p. 1/2            ,
+
+                                   0.5 +  w.p. 1/2                                    -0.5 w.p. 1/2
+
+and the quantization errors   Rm×n are for each entry {+1/2, -1/2} with equal probability. For
+
+                    ~                                                     (9)                BDBT T               = m4 tr BDBT ,
+this particular W , A achieves proxy loss Lworst(A, H) = E                               tr
+
+with Q as either nearest or stochastic rounding. It follows from the supremum in the definition of
+
+Lworst in Eq. (5) that, Lworst(A, H)  m4 tr BDBT . For the LDL assignment of U , the worst
+
+                                                                                                                                     (10)
+case expected quantization error rounding to the integers is 1/2. Therefore, Lworst(LDLQ, H) =
+m
+4   tr  (D),   again   for  Q  as  either  nearest  or   stochastic       rounding.      B    must      be  a  unit  triangular  matrix
+
+since it is the product of unit triangular matrices. Therefore tr BDBT is minimized when B = I,
+
+and
+
+                                          Lworst(LDLQ, H)  Lworst(A, H).
+
+Next, consider the average loss, Lavg, where W  U nif [0, 1]m×n. For Q as nearest rounding, the
+
+entries  of    the  quantization   error    are  U  nif  [-  1  ,  1  ],  because  each      entry  is  independent       and  uniformly
+                                                             2     2
+
+                                                                   2      1/2 2                     1                                (9)
+distributed. It follows that for any entry of , E ij = -1/2 x dx = 12 . Therefore, Lavg(A, H) =
+
+EW Unif[0,1]m×n tr BDBT T = m 12 tr BDBT . For Q as stochastic rounding, the entries
+                                                                                                                               1
+of the quantization error  are U nif [-1, 1]. It follows that for any entry of , E                                   2ij  =
+                                                                                                                               0 x(1 -
+x)dx = 16 . Note that for stochastic rounding, the quantization error will be x with probability
+                                                 m       BDBT                                                                    2ij
+(1  -   |x|).  Therefore,      Lavg(A, H)   =    6  tr                    . Based on these same calculations of E                     ,
+
+                                   (9) m                                                      m
+we have that Lavg(LDL, H) = 12 tr (D) with Q as nearest , and = 6 tr (D) with Q as stochastic
+rounding. By the same reasoning on the minimization of tr BDBT ,
+
+                                            Lavg(LDLQ, H)  Lavg(A, H).
+
+Subsection 3.3 (Incoherence: Optimality with a Spectral Bound)
+
+Definition 1. We say a symmetric Hessian matrix H  Rn×n is µ-incoherent if it has an eigende-
+composition H = QQT such that for all i and j, |Qij| =                             e  T  Qej   µ/           n. By extension, we say
+                                                                                      i                                       
+                                                                                                                µ W F / mn.
+a weight matrix W  Rm×n is µ-incoherent if all i and j, |Wij| =                               e  T  W   ej
+                                                                                                 i
+
+Lemma 8. Let H  Rn×n be a positive semi-definite symmetric matrix, and let a1, . . . , an be a
+sequence of vectors in Rn. Consider the recurrence given by 0 = 0  Rn×n and from k = 0 to
+n-1
+
+                                 k+1 = (I - ekakT )k(I - akekT ) + ekekT .
+
+Let (a1, . . . , an) = tr (Hn). Then if H = LDLT is the LDL decomposition of H, a global
+minimum of  occurs when ak is the kth column of L, and at this minimum,  = tr (D).
+
+Proof. First observe that at step k, k will be 0 in all entries (k)ij if min(i, j)  k. This means
+that changing the last n - k entries of ak does not change  (or ) at all. Without loss of generality,
+
+                                                                   23
+set those entries of ak to 0. If A is the matrix whose kth row is ak, this is equivalent to saying that A
+is strictly lower triangular.
+
+Next, let  be a random Gaussian sampled from N (0, I), and consider the recurrence given by
+
+x0 = 0  Rn and                    xk+1 = xk - ekakT xk + ekekT .
+
+It's straightforward to see that k = E xkxTk . But it's also easy to see that the step-k update only
+modifies/assigns the kth entry of x, and does so based only on earlier entries of x. Since eTk xk = 0,
+and no later step assigns the k-or-lower entries of x,
+
+                ekT xn = ekT xk+1 = 0 - akT xk + ekT  = -aTk xn + ekT ,
+
+which in vector form yields
+
+                                  (I + A)xn = .
+
+In particular, this immediately implies that
+
+                                  n = (I + A)-1(I + A)-T
+
+and
+                    = tr (Hn) = tr (I + A)-T H(I + A)-1 = tr B-T HB-1 .
+
+where B = I + A. Differentiating with respect to B in strictly lower triangular direction  (the only
+direction in which we have degress of freedom, since the diagonal of B must be unit) yields
+
+                                  -2 tr B-T HB-1B-1 .
+
+It's not hard to see that if H = LDLT is the LDL decomposition of H, and BT = L, that the
+gradient is
+
+                        -2 tr DB-1 = -2 tr B-1D = -2T , B-1D.
+
+Since T is strictly upper triangular, but B-1D must be lower triangular, this is 0 so we have a
+minimum. The uniqueness of this minimum (up to assignments of the lower-triangular elements of A
+or B, which have no effect on ) also immediately follows from the recurrence relation. This implies
+the minimum is global. This is what we wanted to show.
+
+Lemma 2. Let H  Rn×n be a µ-incoherent positive semi-definite symmetric matrix and let
+H = (U` + I)D(U` + I)T be its LDL Cholesky decomposition, where U` is a strictly upper triangular
+matrix and D is a (non-negative) diagonal matrix. Then,
+
+                                  tr (D)  µ2 2 tr H1/2 .
+                                              n
+
+Proof. By continuity of tr (D) and tr H1/2 , it suffices to prove the lemma for positive definite H.
+
+First, the closure of positive definite symmetric matrices is the set of positive semi-definite symmetric
+matrices. Second, consider the set of H that are positive definite and satisfy nµ2 tr H1/2 2 -tr (D) 
+0, i.e. are non-negative. The closure of this set (i.e. H  0) must also satisfy that the inequality is
+
+non-negative.
+
+Let H = QQT be the eigendecomposition of H. First, observe that by incoherence,
+
+      T 1/2 1/2 T 2 n µ2 1/2 n µ 1/2 2
+      ek H ek = i (ei Qek)                                i = tr H .
+                                                  n               n
+                             i=1                     i=1
+
+Set
+                                                = µ2 tr H1/2 ,
+                                                      n
+
+and consider the recurrence from Lemma 8 with
+
+                                         H 1/2ek
+                                  ak =
+
+                                             
+
+Then
+
+      k+1 = I - -1ekeTk H1/2 k I - -1H1/2ekeTk                       + ekekT .
+
+                                              24
+Suppose by way of induction that for some scalar the covariance k  H-1/2. For the base case,
+this obviously holds since 0 = 0. At step k,
+
+                 k+1  I - -1ekeTk H1/2 H-1/2 I - -1H1/2ekeTk + ekekT
+
+                        = H-1/2 - 2ekeTk + -1ekekT H1/2ekekT + ekekT
+                         H-1/2.
+Note that with this assignment,
+               akT kak  (-1eTk H1/2)(H-1/2)(-1H1/2ek) = -1ekT H1/2ek  1.
+
+So, by induction it follows that
+
+                                                  µ2
+                                          n  tr H1/2 · H-1/2,
+
+                                                  n
+
+and so                                µ2                                         µ2
+
+                                                                                                   2
+                  tr (Hn)  tr H1/2 tr H · H-1/2 = tr H1/2 .
+                                      n                                             n
+
+But from Lemma 8, we know that tr (D) is the global minimum of tr (Hn) for any assignment of
+
+ak. This immediately gives us the desired result.
+
+Lemma 3. Let H be symmetric positive definite. In the worst case stochastic rounding achieves
+Lworst(Stoch, H) = (m/4) tr (H). In the average case nearest and stochastic rounding achieve
+Lavg({Near, Stoch}, H) = (m/c) tr (H), where c = 12 for nearest, and c = 6 for stochastic.
+
+Proof. For nearest and stochastic rounding, set the linear feedback U in Eq. (2) to be zero. Stochastic
+
+rounding achieves worst-case loss,
+
+                                               (3)                            T        m
+                       Lworst(Stoch, H) = sup E tr H = tr (H) .                                                       (11)
+                                                                                       4
+                                                    W Rm×n
+
+For the average-case proxy loss, recall the computations of E 2ij from the proof of Theorem 1.
+
+                                          (3)                                    T        m
+                  Lavg(Near, H) = EW Unif[0,1]m×n tr H = tr (H)                                                       (12)
+                                                                                          12
+
+                                          (3)                                    T        m
+                  Lavg(Stoch, H) = EW Unif[0,1]m×n tr H = tr (H) .                                                    (13)
+                                                                                          6
+
+Without incoherence: no improvement with a spectral bound
+
+Theorem 4. Consider all H~ with the same spectrum as H. For any positive semi-definite H, the
+
+following holds. On the worst-case loss LDLQ achieves the same error as stochastic rounding,
+
+                                                          ~                                   m
+                          sup            Lworst(LDLQ, H) = Lworst(Stoch, H) = tr (H) .
+                                                                                              4
+            H~ s.t. eig(H~ )=eig(H)
+
+On the average-case loss LDLQ achieves the same error as the corresponding rounding routine. Let
+
+B = {Near, Stoch} and c = 12 for nearest, c = 6 for stochastic.
+
+                                                          ~                               m
+                               sup         Lavg(LDLQ , H) = Lavg(B, H) = tr (H) .
+                                                                                          c
+                  H~ s.t. eig(H~ )=eig(H)
+
+Proof. See Lemma 3 for calculations on the proxy loss for nearest and stochastic rounding.
+
+For LDLQ, we will derive lower and upper bounds on supH~ s.t. eig(H~ )=eig(H) Lworst(LDLQ, H~ ) and
+supH~ s.t. eig(H~ )=eig(H) Lavg(LDLQ, H~ ), and show they are equal. To construct a lower bound, con-
+sider H~ = II where  are the eigenvalues of H. This decomposition is also the LDL decomposition
+
+of H~ , rewritten as H~ = (U + I)D(U + I)-1. It follows that tr (D) = tr H~ for this H~ . Combine
+
+this result with the worst and average-case losses calculated in the proof of Theorem 1. For the
+
+worst-case  loss  from    the  proof  of  Theorem   1,    m  tr (H).     The  lower    bound  for  the  average-case  loss
+                                                          4
+is    m   tr (H)  for  Q  as   nearest,  and     m  tr (H)   for  Q  as  stochastic.   Now   upper    bounds  are  derived
+      12                                         6
+using the preceding calculations in Eq. (11)-(13), and using the worst and average-case optimality of
+
+LDLQ proven in Theorem 1. The lower and upper bounds are tight, proving our result.
+
+                                                          25
+E Proofs for Section 4 (Quantization With Incoherence Processing:
+     Incoherence Processing Step )
+
+Subsection 4.1 (Incoherence via Efficient Orthogonal Multiplication)
+
+Lemma 9 (Theorem 2.4 from Lalley [2] ). There exist constants C and A independent of n such
+that for any function F from the unit sphere in n dimensions to R that is 1-Lipschitz relative to the
+Riemannian metric on the sphere,
+
+                                                                                       nt2
+                          PxSn (F (x) - ExSn [F (x)]  t)  C exp - A
+
+Lemma 10. Let B  Rm×n be a matrix, and let x be a random vector uniformly distributed on the
+unit sphere in Rn. Then there exist global constants A > 0 and C > 0 independent of m and n such
+
+that
+
+                       P Bx2  A BF2 log C  ,
+                                             n              
+
+Proof. Let                                F (x) =  Bx   .
+Observe that
+and so                                             BF
+
+                                  F (x) =            BT Bx     ,
+
+                                             Bx · BF
+
+                                          F (x)  1.
+
+Also observe that for x drawn uniformly from the sphere in n dimensions,
+
+                                  E [F (x)2] = 1 ·                     2     1
+                 E [F (x)]                        BF        E Bx =  .
+                                                                             n
+
+So, applying Lemma 9,
+
+                             Bx 1                                 nt2
+                       P             -   t  C exp -                       .
+                             BF           n                       A
+
+If we let  be                                        nt2
+
+                                      = C exp -      A      ,
+
+then
+
+                                     A log C = t2
+                                     n             
+
+Trivially, then, for some modified global constants A and C,
+
+                                  A       C                 12
+                                     log        = t+ 
+                                  n                         n
+
+This means that                   Bx2 A              C
+i.e.                      P BF2  n log   ,
+
+                       P Bx2  A B2F log C  ,
+                                             n              
+
+This is what we wanted to prove.
+
+                                             26
+Lemma 5. Let H be a positive semi-definite matrix on Rn×n and W a matrix on Rm×n, and suppose
+that m = p1 · p2 · · · pk and n = q1 · q2 · · · qk. Let U1, U2, . . . , Uk, V1, V2, . . . , Vk be independent
+random orthogonal matrices on Rpi×pi and Rqi×qi respectively. Set U as the Kronecker product
+U = U1  U2  · · ·  Uk and V as V = V1  V2  · · ·  Vk Then V HV T is µH -incoherent with
+probability at least 1 - , and U W V T is µW -incoherent with probability at least 1 - , where
+
+         µH = Ak/2 log      C kn2        k/2                                      2C kmn    k
+                                                                                      
+                                             = O~ (1) and µW = Ak log                         = O~ (1)
+
+for some global constants A and C independent of n and k.
+
+Proof. First we will prove what we want to prove about H; then we will prove what we want to prove
+about W . Let Q be a matrix of eigenvectors of H. Observe that since Q is an orthogonal matrix (by
+the spectral theorem, because H is symmetric), Qej is a unit vector, i.e. Qej = 1. Call Qej = y.
+Also observe that
+
+                   eiT (U1  U2  · · ·  Uk) = ((eTi1 U1)  (ei2 T U2)  · · ·  (eik T Uk))
+
+for some indices ij.  Call  e  T   U  j  =  x  T  ,  and observe that the xj  are all independent unit random
+                               ij              j
+
+vectors. So,          ((U1  U2  · · ·  Uk)Q)ij = (x1  x2  · · ·  xk)T y
+
+for random unit vectors x1, . . . , xk and unit vector y. We can easily bound this with k applications of
+Lemma 10 and a union bound, yielding
+
+                    P (x1  x2  · · ·  xk)T y 2  Ak log C k  k,
+                                                         n                    
+
+Setting            yields
+              kn2
+
+                   P (x1  x2  · · ·  xk)T y 2  Ak log             Ckn2 k                   
+                                                               n                        n2 ,
+
+and unioning over all the entries of the large orthogonal matrix,                          
+                   
+                                                                                          k
+              P max ((U1  U2  · · ·  Uk)Q)ij                Ak                  C kn2
+                                                                log                          .
+                        i,j
+                                                            n
+
+Next, for W , observe that if we flatten W , then W/ W F is a unit vector. Then any entry of the
+resulting matrix can be written as
+
+                            (x1  x2  · · ·  xk)T W (y1  y2  · · ·  yk)
+
+where x1, . . . , xk and y1, . . . , yk are k independent random unit vectors. We can easily bound this
+with 2k applications of Lemma 10 and a union bound, yielding
+
+                                                                  2 A2k                   C 2k
+P (x1  x2  · · ·  xk)T W (y1  y2  · · ·  yk)  log                                                2k,
+                                                                              mn          
+
+Setting             yields
+              2kmn
+
+P (x1  x2  · · ·  xk)T W (y 2 A2k 1  x2  · · ·  yk)  log                          2Ckmn 2k               
+                                                                       mn                           ,
+
+                                                                                                       mn
+
+and unioning over all the mn entries of the large orthogonal matrix,                                  
+   
+                                                                                                    2k
+P max eiT (U1  U2  . . . Uk)W (V1  V2  · · ·  Vk)ej                             A2k         2C kmn
+                                                                                     log                .
+          i,j
+                                                                                mn
+
+This is what we wanted to show.
+
+                                                     27
+F Proofs for Section 5 (Extensions and Further Analyses)
+
+Subsection 5.1 (OPTQ is a Special Case of LDLQ)
+
+Theorem 6. OTPQ [1] falls within the class of adaptive rounding procedures with linear feedback
+as described by Eq. (2), and is equivalent to LDLQ in Section 3.
+
+Proof. OPTQ works in the following way. After OPTQ has quantized the first t - 1 components of
+the row vector w, it minimizes the proxy loss over the remaining n - t + 1 elements, keeping the
+first t - 1 elements fixed. It then quantizes the tth element using nearest rounding to the grid and
+clamping. It then proceeds to the next column. If we let  = w^ - w, this proxy loss that it minimizes
+can be written in block form as
+
+ = 1:(t-1)H1:(t-1),1:(t-1)1:(t-1) T + 21:(t-1)H1:(t-1),t:n + t:nHt:n,t:nt:n T
+
+and its minimum over t:n will occur when
+
+                             0 = 1:(t-1)H1:(t-1),t:n + t:nHt:n,t:n,
+
+i.e.
+                                 t:n = -1:(t-1)H1:(t-1),t:n (Ht:n,t:n)-1 .
+
+Now, suppose that H = U~ DU~ T is the LDL decomposition of H, where U~ is unit upper triangular
+and D is diagonal. Since U~ is upper triangular,
+
+                             Ht:n,t:n = U~t:n,t:nDt:n,t:nU~tT:n,t:n.
+
+Similarly,                    H1:(t-1),t:n = U~1:(t-1),t:nDt:n,t:nU~tT:n,t:n.
+This means that
+                                                                                                    -1
+
+                             t:n = -1:(t-1)U~1:(t-1),t:n U~t:n,t:n .
+
+Now, the only part of the value of t:n which matters is the first entry, since this is the one that's
+going to be used to make the next quantization decision. But since U~t:n,t:n is unit upper triangular
+
+                                                      -1
+
+and so is its inverse, U~t:n,t:n et = et, and so
+
+          t = t:ne1 = -1:(t-1)U~1:(t-1),t:net = -1:(t-1)U~1:(t-1),t = -(U~ - I)et.
+Finally, we quantize the t-th weight as
+
+                                     w^t = Q(wt - (W^ - W )(U~ - I)et).
+This update is equivalent to our adaptive rounding with linear feedback procedure in Eq. (2), with U
+assigned from the LDL decomposition of H.
+
+Subsection 5.2 (A Bound for Rounding to a Finite Grid)
+
+Algorithm 5 presents a quantization procedure which theoretically address OPTQ's clamping issue,
+by incorporating a restriction of |W^ ij - Wij| into objective (7). Note that for simplicity, here we
+present the explicit case where only two factors are used in each Kronecker product of orthogonal
+
+matrices; however, the proof should generalize to any number of factors.
+
+Lemma 11. Suppose that for positive definite µ-incoherent matrix H  Rn×n and scalar c > 0, L
+is the solution to the optimization problem
+
+                             minimize: tr HLT L
+
+                             over: L unit upper triangular
+
+                 subject to:  e  T  LT  Lei      1 + c,  i    {1, . . . , n}.
+                                 i
+
+Then the solution satisfies
+
+                             tr HLT L = µ2 2 tr H1/2 .
+                                               n · min(1, c)
+
+                                                 28
+Algorithm 5 "Fixed" Rounding via a Convex Program
+
+Require: W  Rm×n, H  Rn×n, c > 0,  > 0
+Require: factorization m = p1p2, n = p3p4
+draw U1  Rp1×p1 uniformly from the set of orthogonal matrices using seed seed(U1)
+draw U2  Rp2×p2 uniformly from the set of orthogonal matrices using seed seed(U2)
+draw U3  Rp3×p3 uniformly from the set of orthogonal matrices using seed seed(U3)
+draw U4  Rp4×p4 uniformly from the set of orthogonal matrices using seed seed(U4)
+W  (U1  U2)W (U3  U4)
+        (U3T       T
+H               U  4  )H  (  U3    U4)
+
+W  2  2b-1 W + 1 elementwise
+
+W  clamp(W, min = 0, max = 2b - 1)) elementwise
+
+use ADMM or some other solver to solve
+
+                                 minimize: tr HLT L
+
+                                       over: L unit upper triangular
+                                 subject to: eiT LT Lei  1 + c, i  {1, . . . , n}.
+
+note that when c = , L-1 is the factor from the LDL decomposition of H
+
+U`  L-1 - I                                                                                                 round with LF
+for k  {1, . . . , n} do W^ k  clamp(Q(Wk + (W - W^ )U`k), 0, 2b - 1)
+
+W^   22bW^-1 - 1
+
+W^      (U1T    UT    )W^  (U3T      UT   )
+
+                  2                    4
+return W^ encoded as a tuple of the integer rounded values, the scale factor , and the seeds
+
+Proof. Let   R1×n be a random standard Gaussian variable as a row vector, let A be a matrix, and
+consider the recurrence relation over xt  R1×n given by x0 = 0 and
+
+                                       xt = xt-1 - xt-1AeieiT + eieTi
+
+We first note that since xt is supported only on {1, . . . , t}, if M denotes the strictly upper triangular
+mask, this update step is equivalent to
+
+                                 xt  =  xt-1    -     xt-1(A    M )eieTi     +    ei  e  T  .
+                                                                                         i
+
+From here, it's fairly easy to see by induction that
+
+                                             xn = -xn(A  M ) + ,
+
+and so
+
+                                                xn(I + A  M ) = ,
+
+or
+                                             xn = (I + A  M )-1.
+
+Now, since I + A  M is a unit upper triangular matrix, its inverse is also a unit upper triangular
+matrix. If we let L = (I + A  M )-1, then L is a unit upper triangular matrix and
+
+                                                   E xnT xn = LT L.
+
+We are going to choose A such that L is a feasible solution to our optimization problem and has the
+
+desired objective. Next, let t = E           x  T  x  t  , and observe that
+                                                t
+
+                             t = I - AeieiT T t-1 I - AeieiT + eieiT .
+
+Let  > 0 be some constant to be set later, and set A = H1/2. Suppose by way of induction that
+for some constant  > 0 to be set later, t  H-1/2. The base case clearly holds since 0 = 0.
+For the inductive step,
+
+                                                                 T
+
+                   t   I - H1/2eieiT H-1/2 I - H1/2eieiT + eieiT
+
+                      =    H -1/2    -    2eieTi         +  2eieiT H1/2eieiT          +     e  i  e  T  .
+                                                                                                     i
+
+                                                            29
+This inductive step will hold if, letting h = maxi eTi H1/2ei,
+                                                 2  1 + 2h
+
+On the other hand,
+
+                    eiT LT Lei = E (xnei)2
+                                = E (-xi-1Aei + ei)2
+
+                                 = E (-xi-1Aei)2 + 1
+
+                                 = eiT AT i-1Aei + 1
+                                 = 2eiT H1/2i-1H1/2ei + 1
+                                  2eiT H1/2H-1/2H1/2ei + 1
+                                  2eTi H1/2ei + 1.
+
+So the constraint of our optimization problem will be satisfied if
+                                                     2h  c.
+
+To satisfy these constraints, set  = max(h, h/c) and  = -1. Then
+
+2 max(h, h/c)-1 · max(h, h/c)  1 + max(h, h/c)-2 · max(h, h/c) · h,
+
+and
+                                    max(h, h/c)-2 · max(h, h/c) · h  c.
+
+Also, the objective will be bounded by
+
+tr HLT L = tr (Hn)   tr H1/2 = max(1, c-1) · h · tr H1/2 .
+
+Now, applying incoherence to bound h, where H = U U T is the eigendecomposition of H,
+
+                T 1/2 1/2 T 2 1/2 n n µ2 µ 1/2 2
+                ei H ei = j (ei U ej )  j                            = tr H .
+                                                                nn
+                    j=1                             j=1
+
+So this yields a whole bound of
+
+                    tr HLT L = µ2 2 tr H1/2 .
+                                      n · min(1, c)
+
+This is what we wanted to show.
+
+Lemma 12. Suppose that we quantize the row vector w  R1×n using L the solution to the
+optimization problem
+
+                    minimize: tr HLT L
+
+                    over: L unit upper triangular
+
+                    subject to:  e  T  LT  Lei    1 + c,  i       {1, . . . , n}
+                                    i
+
+and
+                                   w^ = Qstoch w - (w^ - w)(L-1 - I) ,
+
+where Qstoch denotes elementwise unbiased stochastic rounding. Then for any u  Rn and any
+>0
+
+                                                    1             2
+                    P |(w^ - w)u|  Lu log                               .
+                                                    2             
+
+In particular,
+
+                    P (w^ - w)(L-1 - I)ei  c log 2  .
+                                                          2          
+
+                                                30
+Proof. Let  be the error of stochastic rounding, and observe that each entry is, conditioned on earlier
+steps, zero mean and supported on two values that differ by 1. Also observe that
+
+                                     w^ = w - (w^ - w)(L-1 - I) + ,
+
+and so
+
+                                                 w^ - w = L
+
+and
+                                    E [exp ((w^ - w)u)] = E [exp (Lu)] .
+
+From a repeated application of Hoeffding's lemma, we get
+
+                   E [exp ((w^ - w)u)]  exp 1 Lu2 .
+                                                       8
+
+Setting u  u for  > 0,
+                                 E [exp ((w^ - w)u)]  exp 2 Lu2 .
+                                                                        8
+
+And by Markov's inequality,
+                  P (exp ((w^ - w)u)  exp(R))  exp(-R) exp 2 Lu2 ,
+                                                                                       8
+
+i.e.
+                             P ((w^ - w)u  R)  exp -R + 2 Lu2 .
+                                                                            8
+
+Minimizing the right side over  yields  = 4R Lu-2 and
+
+                   P ((w^ - w)u  R)  exp -2R2 Lu-2 .
+
+By a union bound,
+
+                   P (|(w^ - w)u|  R)  2 exp -2R2 Lu-2 .
+
+Now setting the right side equal to ,
+
+                                                            1          2
+                   P |(w^ - w)u|  Lu log                                   .
+                                                            2          
+
+This is what we wanted to show. The second statement follows from the fact that
+ L(L-1 - I)ei 2 = ei - Lei2 = eiT ei -eTi Lei -eTi LT ei +eTi LT Lei  1-1-1+(1+c) = c.
+
+Lemma 13. Suppose that we quantize the row vector w  R1×n using L the solution to the
+optimization problem
+
+                   minimize: tr HLT L
+
+                   over: L unit upper triangular
+
+                   subject to:         e  T  LT  Lei      1 + c,  i    {1, . . . , n}
+                                          i
+
+and
+                                    w^ = Qstoch w - (w^ - w)(L-1 - I) ,
+
+where Qstoch denotes elementwise unbiased stochastic rounding. Suppose that for some integer b,
+1  wij  2b - 2. Then if we set
+
+                                c = 2 log                 4mn -1       ,
+
+                                                          
+
+then with probability at least 1 - , 0  w^ij  2b - 1 and
+
+        tr (w^ - w)H(w^ - w)T  µ2m tr H1/2 2 log 4mn 2 .
+                                                      4n                               
+
+                                                      31
+Proof. First, from the previous lemmas, if U ei is the ith eigenvector of H, with eigenvalue i since
+
+                     P i(ejT (w^ - w)U ei)2  i LU ei2 · 1 log 2  .
+                                                       2            
+
+By the union bound,
+
+         P i, j, i(ejT (w^ - w)U ei)2  i LU ei2 · 1 log 2mn  .
+                                                          2           
+
+And so                                                                                       
+         P  i(eTj (w^ - w)U ei)2  i LU ei2 · 1 log                                             ,
+                                                                      2mn
+               i,j i,j 2                                                
+
+which simplifies to
+
+         P tr (w^ - w)H(w^ - w)T  m tr HLT L · 1 log 2mn  .
+                                                          2                              
+
+Now applying the other lemma,
+
+         P tr (w^ - w)H(w^ - w)T  µ2m tr H1/2 2 log 2mn  .
+                                 2n · min(1, c)                                            
+
+And substituting   /2,
+
+         P tr (w^ - w)H(w^ - w)T  µ2m tr H1/2 2 log 4mn                                             
+                                 2n · min(1, c)                                                  .
+
+                                                                                                    2
+
+On the other hand, again by a union bound from the previous lemma,
+
+         P i, j, ejT (w^ - w)(L-1 - I)ei            c  log     4mn                            
+                                                                                           .
+                                                    2               
+                                                                                              2
+
+Setting
+
+                                               4mn -1
+                               c = 2 log
+
+                                                 
+
+yields
+                               P i, j, ejT (w^ - w)(L-1 - I)ei  1   .
+                                                                                      2
+
+And so by another union bound, the probability that
+
+         tr (w^ - w)H(w^ - w)T  µ2m tr H1/2 2 log 4mn 2
+                                                4n                                       
+
+and
+                                      max ejT (w^ - w)(L-1 - I)ei  1
+
+                                                        i,j
+
+is no less than 1-. It's clear that if this second inequality holds, the value we pass in to the stochastic
+quantizer will be in range, and thus so will the output. This proves what we want.
+
+Theorem 14. Suppose that we are given an input matrix w with bounded maximum entry magnitude
+
+w and we want to quantize it using b bits. Suppose that we first re-scale the entries of w by
+mapping
+
+                                        2b - 3   wij + 1 + 1;
+                               wij  2           w
+
+this guarantees that 1  wij  2b - 2. Then, suppose we quantize using the procedure described in
+
+the previous lemma. Finally, we undo the scaling. Then then with probability at least 1 - , all the
+
+quantized weights will be in range (no overflow or need for clipping) and
+
+         tr (w^ - w)H(w^ - w)T   µ2m                1/2 2 2                                4mn 2
+                                 b 2 tr H                 w log                                   .
+                                 n(2 - 3)                                                    
+
+                                                32
+Proof. This is a straightforward consequence of the previous lemma.
+
+Theorem 15. Suppose that we are given an input matrix w with bounded wF and we want to
+quantize it using b bits. Suppose that we first multiply by two-factor orthogonal matrices, and then
+
+we re-scale the entries of w by mapping
+
+                                                                     
+
+wij  2b - 3                                     wij                + 1 + 1;
+            2 wF                              mn A2 log
+                                                         2Cmn 2
+                                                            
+
+this guarantees that 1  wij  2b - 2. Then, suppose we quantize using the procedure described in
+the previous lemma. Finally, we undo the scaling and multiplication. Then then with probability at
+least 1 - , all the quantized weights will be in range (no overflow or need for clipping) and
+
+                    T A4                                 1/2 2 2         12Cmn2 6
+tr (w^ - w)H(w^ - w)  2 b 2 tr H                                wF log
+                                          n (2 - 3)                          
+
+                                 = O~     1          1/2 2 2
+                                          2 b tr H       wF .
+                                          n4
+
+Proof. It is a straightforward consequence of Lemma 5, that unioning over the three bounds on the
+infinity norm of w, the incoherence of H, and the stochastic rounding, with probability at least 1 - 3,
+
+tr (w^ - w)H(w^ - w)T                     m              1/2 2 2             4mn 2
+                                          b 2 tr H              wF log
+                                          n(2 - 3)                           
+
+                                              · A2 log 2Cn2 2 · A2 log 2Cn 2 .
+                                                                  mn         
+
+Substituting   /3,
+
+tr (w^ - w)H(w^ - w)T                     1              1/2 2 2             12mn 2
+                                  b 2 tr H                      wF log          
+                                          n(2 - 3)
+                                                                             6Cn 2
+                                              · A2 log   6C n2  2 A2                   .
+                                                                  · log
+                                                                    n          
+
+And this right side is clearly less than
+
+                    T A4                                 1/2 2 2         12Cmn2 6
+tr (w^ - w)H(w^ - w)  2 b 2 tr H                           wF log                         .
+                                 n (2 - 3)                                   
+
+This is what we wanted to show.
+
+Theorem 7. Suppose that we run Algorithm 5 (Supplement) to quantize a matrix W  Rm×n by
+solving the objective (7). Then there exists an assignment of the algorithm's hyperparameters c and 
+such that with probability at least 1 - , all the quantized weights will be in range (no overflow or
+need for clipping) and
+
+tr (W^ - W )H(W^ - W )T = O~ 1 n24b tr H1/2 2 W 2F .
+
+Proof. This follows directly from the previous theorem, which says explicitly what the hyperparame-
+ter assignments should be.
+
+References for the Appendix
+
+[1] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Optq: Accurate quantization
+     for generative pre-trained transformers. In International Conference on Learning Representations,
+     2023.
+
+                                              33
+[2] Steve Lalley. Lecture notes on measure-theoretic probability 2. http://galton.uchicago.
+     edu/~lalley/Courses/383/Concentration.pdf, 2018.
+
+[3] Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Christos Louizos, and Tijmen Blankevoort.
+     Up or down? adaptive rounding for post-training quantization. In International Conference on
+    Machine Learning, pages 7197-7206. PMLR, 2020.
+
+                                                          34
+
