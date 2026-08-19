@@ -196,6 +196,22 @@ def main():
         m = int(keep.sum()) * r * 16 + (V - int(keep.sum())) * r * bits + r * d * 16
         print(f"{p:<10.3f}{int(keep.sum()):>8}{a:>7.2f}%{b:>8.2f}%{m:>12.0f}{m/mem['bf16']*100:>8.1f}%")
 
+    # ---------- E4 全量 head 上的行级精度分配（不投影） ----------
+    # 投影量化把误差挤进 S 反而更差；全量量化误差在 ⊥ 方向被 h 湮灭。
+    # 真正杠杆 = 行级 margin 暴露分配，作用在全量 W 上。
+    print(f"\n--- E4 全量 head 行级分配（τ={tau}，热行 bf16 / 冷行 {bits}bit，无投影）---")
+    print(f"{'热行比例p':<10}{'热行数':>8}{'flip率':>8}{'远flip率':>9}{'内存(bits)':>12}{'内存%bf16':>9}")
+    for p in (0.0, 0.001, 0.003, 0.01, 0.03, 0.1, 0.5, 1.0):
+        n_hot = max(int(p * V), 1 if p > 0 else 0)
+        if n_hot == 0:
+            keep = torch.zeros(V, dtype=torch.bool)
+        else:
+            keep = torch.zeros(V, dtype=torch.bool)
+            keep[torch.argsort(exposure, descending=True)[:n_hot]] = True
+        a, b, c = run_variant(lf, h, tidx, W, bits, args.groupsize, Vr=None, W_keep=keep)
+        m = int(keep.sum()) * d * 16 + (V - int(keep.sum())) * d * bits
+        print(f"{p:<10.3f}{int(keep.sum()):>8}{a:>7.2f}%{b:>8.2f}%{m:>12.0f}{m/mem['bf16']*100:>8.1f}%")
+
 
 if __name__ == "__main__":
     main()
