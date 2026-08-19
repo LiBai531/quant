@@ -120,6 +120,7 @@ def main():
     ap.add_argument("--tau", type=float, default=TAU)
     ap.add_argument("--chunk", type=int, default=2)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--cache", default="", help="数据缓存路径；若已存在则直接加载，跳过前向")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -140,8 +141,23 @@ def main():
     print(f"LM head: {V}×{d}  (占模型内存大头的部分，当前方案为 bf16 全保)")
 
     data = prepare_data(tok, args.seqlen, args.n_samples, args.dataset)
-    print(f"语料 {len(data)} 条 × {args.seqlen} tok\n")
-    h, lf, tidx = collect_head_data(fp, data, args.device, args.chunk)
+    print(f"语料 {len(data)} 条 × {args.seqlen} tok")
+    import os
+    ck_h, ck_lf, ck_t = (args.cache + ".h.pt", args.cache + ".lf.pt", args.cache + ".t.pt")
+    if args.cache and all(os.path.exists(p) for p in (ck_h, ck_lf, ck_t)):
+        print(f"加载缓存 {args.cache}（跳过前向）")
+        h = torch.load(ck_h, map_location="cpu", weights_only=True)
+        lf = torch.load(ck_lf, map_location="cpu", weights_only=True)
+        tidx = torch.load(ck_t, map_location="cpu", weights_only=True)
+    else:
+        h, lf, tidx = collect_head_data(fp, data, args.device, args.chunk)
+        if args.cache:
+            # 逐张量原子保存，中断只丢未完成的一个，不损坏已有部分
+            for p, v in ((ck_h, h), (ck_lf, lf), (ck_t, tidx)):
+                torch.save(v, p + ".tmp")
+                os.replace(p + ".tmp", p)
+            print(f"缓存已存 {args.cache}.*")
+    print()
 
     # ---------- E1 内在秩 ----------
     evals, evecs, r_choices = spectrum_report(h)
@@ -199,9 +215,20 @@ def main():
     # ---------- E4 全量 head 上的行级精度分配（不投影） ----------
     # 投影量化把误差挤进 S 反而更差；全量量化误差在 ⊥ 方向被 h 湮灭。
     # 真正杠杆 = 行级 margin 暴露分配，作用在全量 W 上。
+    # 每行结果立即落盘，被杀后重跑自动续算（每格一次全量 matmul，约 3-4 分钟）。
+    e4_out = (args.cache + ".e4.txt") if args.cache else "e4_result.txt"
+    done = set()
+    if os.path.exists(e4_out):
+        for ln in open(e4_out, encoding="utf-8"):
+            if ln.startswith("p="):
+                done.add(ln.split()[0].split("=")[1])
     print(f"\n--- E4 全量 head 行级分配（τ={tau}，热行 bf16 / 冷行 {bits}bit，无投影）---")
     print(f"{'热行比例p':<10}{'热行数':>8}{'flip率':>8}{'远flip率':>9}{'内存(bits)':>12}{'内存%bf16':>9}")
     for p in (0.0, 0.001, 0.003, 0.01, 0.03, 0.1, 0.5, 1.0):
+        key = f"{p:g}"
+        if key in done:
+            print(f"{p:<10.3f}   (已缓存，跳过)")
+            continue
         n_hot = max(int(p * V), 1 if p > 0 else 0)
         if n_hot == 0:
             keep = torch.zeros(V, dtype=torch.bool)
@@ -210,6 +237,8 @@ def main():
             keep[torch.argsort(exposure, descending=True)[:n_hot]] = True
         a, b, c = run_variant(lf, h, tidx, W, bits, args.groupsize, Vr=None, W_keep=keep)
         m = int(keep.sum()) * d * 16 + (V - int(keep.sum())) * d * bits
+        with open(e4_out, "a", encoding="utf-8") as f:
+            f.write(f"p={key} nhot={int(keep.sum())} flip={a:.4f} far={b:.4f} mem={m} pct={m/mem['bf16']*100:.3f}\n")
         print(f"{p:<10.3f}{int(keep.sum()):>8}{a:>7.2f}%{b:>8.2f}%{m:>12.0f}{m/mem['bf16']*100:>8.1f}%")
 
 
