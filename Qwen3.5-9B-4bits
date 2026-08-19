@@ -1,0 +1,69 @@
+root@liteserver-hps-148c-00041:/wuhu_new/l00562845/acs-behave# ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 python flip_diagnosis.py --model /wuhu_new/models/Qwen3.5-9B/ --bits 4 --groupsize 128 --seqlen 512 --n_samples 6 --dataset /wuhu_new/l00562845/acs-behave/sinq.txt
+Loading weights: 100%|████████████████████████████████████████████████████████████████████████████████████████████████| 427/427 [00:03<00:00, 133.78it/s]
+/usr/local/python3.12.13/lib/python3.12/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py:817: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+  init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(0, 16).log_())
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/storage.py:55: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+  if self.device.type != 'cpu':
+模型 /wuhu_new/models/Qwen3.5-9B/  位宽 4  groupsize 128  量化范围 all
+样本 6 条 × 512 tokens
+collecting: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████| 6/6 [00:08<00:00,  1.38s/it]
+
+=== 总览 ===  位置数 3072   翻转 645   flip率 21.00%
+远端翻转（目标不在 FP top-k 内）：29 (4.5% of flips)
+翻转位置的边际：mean m=0.470  median=0.297  (全量 mean=1.902)
+
+=== 按边际 m 分桶的 flip 率（越靠近决策边界越危险） ===
+m 区间               样本数   flip数     flip率
+0~0.1              215     135    62.79%
+0.1~0.3            389     189    48.59%
+0.3~0.7            545     173    31.74%
+0.7~1.5            707     118    16.69%
+1.5~3              566      25     4.42%
+3~6                432       5     1.16%
+6~∞                218       0     0.00%
+
+=== 按边际收缩 e 分桶的 flip 率（e 大 = 量化在此方向吃得多） ===
+e 区间               样本数   flip数     flip率
+-∞~0              1503     106     7.05%
+0~0.1              182      14     7.69%
+0.1~0.3            299      71    23.75%
+0.3~0.7            484     155    32.02%
+0.7~1.5            430     196    45.58%
+1.5~3              142      77    54.23%
+3~6                 28      22    78.57%
+6~∞                  4       4   100.00%
+
+=== (m, e) 二维 flip 率热力图（行=m 列=e, %）===
+m\e            -∞~0      0~0.1    0.1~0.3    0.3~0.7    0.7~1.5      1.5~3        3~6        6~∞
+0~0.1         26.2%      60.0%     100.0%     100.0%     100.0%     100.0%     100.0%       nan%
+0.1~0.3       20.8%      18.5%      71.4%     100.0%     100.0%     100.0%     100.0%       nan%
+0.3~0.7        7.9%       8.6%      15.1%      58.9%     100.0%     100.0%     100.0%       nan%
+0.7~1.5        3.4%       0.0%       9.5%       8.5%      53.9%     100.0%     100.0%     100.0%
+1.5~3          0.7%       0.0%       0.0%       3.6%       4.7%      45.0%     100.0%     100.0%
+3~6            0.0%       0.0%       0.0%       0.0%       1.6%       3.1%      40.0%     100.0%
+6~∞            0.0%       0.0%       0.0%       0.0%       0.0%       0.0%       0.0%       nan%
+
+=== 误差来源分解（logit gap 扰动的精确一阶分解）===
+恒等式数值残差 |total−(direct+propa+cross)|：median=5.51e-03  max=2.80e-02  （应接近 0，否则分解有 bug）
+在翻转位置上： |direct| median=0.2147   |propa| median=0.5952   |cross| median=5.79e-02
+|direct| / |propa| 中位数之比 = 0.36
+-> 上游传播误差主导：需要动 body 的失真度量（margin/Fisher 加权）。
+
+=== 异方差检验：flip 率按最终隐状态范数 ||h|| 四分位 ===
+||h|| 分位         全量flip率     小边际(m<0.5)flip率
+Q1                12.11%              40.50%
+Q2                18.36%              40.95%
+Q3                26.43%              55.07%
+Q4                27.08%              49.81%
+-> 未见强异方差信号（或小边际样本不足）。
+
+=== 乘性收缩检验：m̃ = c·m + b + ε（自然文本，小 margin 制域）===
+c = 0.9715 ± 0.0085   b = 0.0162   R² = 0.8089
+-> c 显著 < 1（z=3.3）：乘性收缩在本制域成立，纯加性(c=1)被拒绝。
+γ 预测：γ_head = 0.0152   γ_body(块能量加权) = 0.0489   -> c_pred = 0.9359
+对照：c_fit = 0.9715   |c_fit − c_pred| = 0.0356   （命中 ⇒ 投影理论成立；偏差大 ⇒ 检查通路假设）
+
+=== 综合判读 ===
+flip 中发生在 m<0.5 的比例：65.1%
+-> 边际感知失真（在 m 小的位置定向降误差）收益最大。
+m 与 flip 的 Pearson 相关：-0.344（负 = 边际越小越易翻转，预期）
